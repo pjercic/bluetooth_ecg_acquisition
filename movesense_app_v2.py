@@ -1,10 +1,11 @@
 import sys
 import os
 import csv
+import re
 import zlib
 import struct
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from bleak import BleakClient, BleakScanner
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -91,6 +92,58 @@ def sf_decode(frame: bytes) -> bytes:
     if recvd_crc != calc_crc:
         return b""
     return payload
+
+
+def sanitize_filename_part(text: str) -> str:
+    """Replaces characters that are unsafe in filenames with underscores."""
+    return re.sub(r'[^A-Za-z0-9._-]', '_', text).strip('._') or "unnamed"
+
+
+def parse_sbem_hr(raw: bytes) -> List[Dict[str, Any]]:
+    """Best-effort extraction of /Meas/HR samples from a Movesense SBEM log.
+
+    SBEM layout: b"SBEM" + 4 version bytes, then chunks of
+      id  : 1 byte (0xFF -> followed by uint16 LE id)
+      len : 1 byte (0xFF -> followed by uint32 LE length)
+      data: <len> bytes
+    An HR data chunk holds float32 'average' (bpm) followed by uint16 'rrData' values (ms).
+    Chunks that do not look like HR samples (descriptors, other measurements) are skipped.
+    Returns a list of {'hr': float, 'rr': [int, ...]} in log order.
+    """
+    samples: List[Dict[str, Any]] = []
+    if len(raw) < 8 or raw[:4] != b"SBEM":
+        return samples
+    pos = 8
+    n = len(raw)
+    while pos < n:
+        chunk_id = raw[pos]; pos += 1
+        if chunk_id == 0xFF:
+            if pos + 2 > n:
+                break
+            chunk_id = struct.unpack("<H", raw[pos:pos + 2])[0]; pos += 2
+        if pos >= n:
+            break
+        length = raw[pos]; pos += 1
+        if length == 0xFF:
+            if pos + 4 > n:
+                break
+            length = struct.unpack("<I", raw[pos:pos + 4])[0]; pos += 4
+        data = raw[pos:pos + length]
+        pos += length
+        if len(data) != length:
+            break  # truncated file
+
+        # Heuristic HR chunk validation
+        if length < 6 or (length - 4) % 2 != 0:
+            continue
+        avg = struct.unpack("<f", data[0:4])[0]
+        if not (avg == avg) or not (0 <= avg <= 300):  # NaN / implausible
+            continue
+        rr = list(struct.unpack(f"<{(length - 4) // 2}H", data[4:]))
+        if not rr or not all(200 <= v <= 3000 for v in rr):
+            continue
+        samples.append({'hr': avg, 'rr': rr})
+    return samples
 
 
 def pack_serial(serial_str: str) -> bytes:
@@ -265,6 +318,34 @@ class MovesenseWhiteboardClient:
             self.pending_requests.pop(req_id, None)
             raise RuntimeError(f"Failed to get DataLogger state for {self.mac}")
 
+    async def get_datalogger_config_raw(self, timeout: float = 5.0) -> Optional[bytes]:
+        """GET /Mem/DataLogger/Config. Returns the raw response body (or None on failure)."""
+        req_id = self._next_req_id()
+        fut = asyncio.get_running_loop().create_future()
+        self.pending_requests[req_id] = fut
+
+        client_bytes = bytes([self.client_id & 0xFF, (self.client_id >> 8) & 0xFF, 0x00])
+        payload = RES_ID_DATALOGGER_CONFIG + client_bytes + bytes([0x00])
+        header = bytes([0xA5, WB_MSG_PROVIDER_GET_REQUEST, len(payload), 0x00]) + struct.pack("<H", req_id)
+
+        await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(header + payload), response=True)
+        try:
+            resp = await asyncio.wait_for(fut, timeout=timeout)
+            body = resp['body']
+            if len(body) >= 8 and struct.unpack("<H", body[6:8])[0] == 200:
+                return body[8:]
+            return None
+        except asyncio.TimeoutError:
+            self.pending_requests.pop(req_id, None)
+            return None
+
+    async def is_hr_logging_configured(self) -> Optional[bool]:
+        """True if the DataLogger config contains /Meas/HR, False if not, None if unknown."""
+        raw = await self.get_datalogger_config_raw()
+        if raw is None:
+            return None
+        return b"/Meas/HR" in raw
+
     async def set_datalogger_state(self, new_state: int, timeout: float = 6.0) -> bool:
         """Sets the DataLogger state (3 = Start Logging, 2 = Stop Logging / Ready)."""
         req_id = self._next_req_id()
@@ -307,21 +388,27 @@ class MovesenseWhiteboardClient:
                 status_code = struct.unpack("<H", body[6:8])[0]
                 if status_code == 200 and len(body) > 10:
                     raw_data = body[8:]
-                    if len(raw_data) >= 12:
-                        entry_id = struct.unpack("<I", raw_data[4:8])[0]
-                        if entry_id > 0:
+                    # Parse every 12-byte entry record (uint32 count/flags, uint32 id, uint32 extra)
+                    for off in range(0, len(raw_data) - 11, 12):
+                        entry_id = struct.unpack("<I", raw_data[off + 4:off + 8])[0]
+                        if 0 < entry_id < 0x10000:
                             entries.append({'id': entry_id, 'size': 0})
+                    entries.sort(key=lambda e: e['id'])
             return entries
         except asyncio.TimeoutError:
             self.pending_requests.pop(req_id, None)
             return entries
 
     async def download_log_data(self, log_id: int, target_filepath: str, timeout: float = 30.0) -> bool:
-        """Downloads log file data from the sensor and saves it to the target file."""
+        """Downloads log file data from the sensor and saves it to the target file.
+
+        Returns True only if the sensor sent its end-of-data marker (a timeout counts as incomplete).
+        """
         resource_path = f"/Mem/Logbook/byId/{log_id}/Data"
         res_id = await self.resolve_resource(resource_path)
         if not res_id:
             return False
+        completed = False
 
         # Drain previous stream data
         while not self.data_stream_queue.empty():
@@ -343,17 +430,20 @@ class MovesenseWhiteboardClient:
                 try:
                     chunk = await asyncio.wait_for(self.data_stream_queue.get(), timeout=timeout)
                     if not chunk or len(chunk) < 4:
+                        completed = True
                         break
                     offset = struct.unpack("<I", chunk[0:4])[0]
                     data_bytes = chunk[4:]
                     if len(data_bytes) == 0:
+                        completed = True
                         break  # End marker
                     f_out.seek(offset)
                     f_out.write(data_bytes)
                 except asyncio.TimeoutError:
+                    print(f"⚠️ Download of log {log_id} timed out before end marker (incomplete).")
                     break
 
-        return os.path.exists(target_filepath) and os.path.getsize(target_filepath) > 0
+        return completed and os.path.exists(target_filepath) and os.path.getsize(target_filepath) > 0
 
     async def clear_logbook(self, timeout: float = 8.0) -> bool:
         """Erases all stored logs from the sensor logbook memory (DELETE /Mem/Logbook/Entries)."""
@@ -609,11 +699,23 @@ class MovesenseApp(QMainWindow):
     @asyncSlot()
     async def start_recording(self):
         """Notifies Whiteboard on each sensor to start internal DataLogger logging, then disconnects BLE."""
-        self.session_id = self.session_input.text().strip()
-        
-        if not self.session_id:
+        raw_session = self.session_input.text().strip()
+
+        if not raw_session:
             QMessageBox.warning(self, "Error", "Please enter a Session ID.")
             return
+        self.session_id = sanitize_filename_part(raw_session)
+        if self.session_id != raw_session:
+            self.session_input.setText(self.session_id)
+
+        existing = [f for f in (f"{self.session_id}.csv", f"{self.session_id}_events.csv") if os.path.exists(f)]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Overwrite Session?",
+                f"Files for session '{self.session_id}' already exist:\n" + "\n".join(existing) +
+                "\n\nOverwrite them?")
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         if not self.sensors_to_connect:
             QMessageBox.warning(self, "Error", "Please add at least one sensor from the scan list.")
             return
@@ -646,6 +748,9 @@ class MovesenseApp(QMainWindow):
 
         started_sensors = []
         failed_sensors = []
+        config_warnings = []
+        for sensor in self.sensors_to_connect:
+            sensor.pop('log_start', None)
 
         # Connect to each sensor sequentially and start Whiteboard DataLogger
         for sensor in self.sensors_to_connect:
@@ -658,11 +763,21 @@ class MovesenseApp(QMainWindow):
             try:
                 await wb.connect()
                 print(f"✅ Handshake OK with {user_id} (Serial: {wb.serial_number})")
-                
+
+                # Verify the DataLogger is configured to record /Meas/HR (RR intervals)
+                hr_cfg = await wb.is_hr_logging_configured()
+                if hr_cfg is False:
+                    print(f"⚠️ {user_id}: DataLogger config does not include /Meas/HR - no RR data would be logged.")
+                    config_warnings.append(user_id)
+                elif hr_cfg is None:
+                    print(f"⚠️ {user_id}: could not read DataLogger config; continuing.")
+
                 # Command Whiteboard DataLogger to start logging (State 3 = DATALOGGER_LOGGING)
                 print(f"🚀 Starting DataLogger on {user_id}...")
                 success = await wb.set_datalogger_state(3)
                 if success:
+                    # PC reference time for this sensor's log: RR timestamps are reconstructed from it
+                    sensor['log_start'] = datetime.now()
                     print(f"✅ {user_id} DataLogger is now LOGGING internally.")
                     started_sensors.append(user_id)
                 else:
@@ -697,6 +812,13 @@ class MovesenseApp(QMainWindow):
         if failed_sensors:
             status_msg += f" | Failed: {', '.join(failed_sensors)}"
         self.event_status_label.setText(status_msg)
+        if config_warnings:
+            QMessageBox.warning(
+                self, "HR Logging Not Configured",
+                "These sensors' DataLogger is not configured to log /Meas/HR, so no RR intervals "
+                f"will be recorded:\n{', '.join(config_warnings)}\n\n"
+                "Configure the DataLogger with path /Meas/HR (e.g. via the Movesense Showcase app), "
+                "then restart the session.")
         print(f"\n🎉 Session '{self.session_id}' is running! Sensors are logging in low-power mode.")
 
     @asyncSlot()
@@ -709,10 +831,15 @@ class MovesenseApp(QMainWindow):
 
         downloaded_files = []
         cleared_sensors = []
+        rr_rows = []  # [timestamp_dt, user_id, hr, rr_ms]
+        rr_counts = {}
 
         for sensor in self.sensors_to_connect:
             user_id = sensor['user']
             mac = sensor['mac']
+            if 'log_start' not in sensor:
+                print(f"⏭ Skipping {user_id}: logging was never started on this sensor.")
+                continue
             print(f"\n🔄 Reconnecting to {user_id} ({mac}) to stop logging & retrieve data...")
             self.event_status_label.setText(f"Retrieving data from {user_id} ({mac})...")
 
@@ -730,29 +857,47 @@ class MovesenseApp(QMainWindow):
                 entries = await wb.get_logbook_entries()
                 print(f"📋 Found {len(entries)} log entries on {user_id}.")
 
+                entries_known = bool(entries)
                 log_id = entries[-1]['id'] if entries else 1
-                target_filename = f"{self.session_id}_{user_id}.sbem"
+                target_filename = f"{self.session_id}_{sanitize_filename_part(user_id)}.sbem"
 
-                # Step 3: Download log data
+                # Step 3: Download log data (raw SBEM is always kept as a backup)
                 print(f"📥 Downloading Log ID {log_id} to {target_filename}...")
                 downloaded = await wb.download_log_data(log_id, target_filename)
 
-                # Step 4: Integrity Verification
-                file_exists = os.path.exists(target_filename)
-                file_size = os.path.getsize(target_filename) if file_exists else 0
-
-                if file_exists and file_size > 0:
-                    print(f"✅ Log file verified: {target_filename} ({file_size} bytes).")
+                # Step 4: Integrity Verification + RR extraction
+                file_size = os.path.getsize(target_filename) if os.path.exists(target_filename) else 0
+                samples = []
+                if file_size > 0:
                     downloaded_files.append(f"{target_filename} ({file_size} bytes)")
+                    with open(target_filename, 'rb') as f_in:
+                        samples = parse_sbem_hr(f_in.read())
 
-                    # Step 5: Safe Erase
+                # Reconstruct RR timestamps: cumulative sum of RR intervals from the PC log-start time.
+                # Each timestamp marks the end of that beat interval (same convention as v1 live mode).
+                t_ms = 0
+                count = 0
+                for s in samples:
+                    for rr in s['rr']:
+                        t_ms += rr
+                        ts = sensor['log_start'] + timedelta(milliseconds=t_ms)
+                        rr_rows.append([ts, user_id, round(s['hr']), rr])
+                        count += 1
+                rr_counts[user_id] = count
+                print(f"💓 Extracted {count} RR intervals for {user_id}.")
+
+                # Step 5: Safe Erase - only when the download completed, the log id was real,
+                # and RR data was actually decoded.
+                if downloaded and entries_known and count > 0:
                     print(f"🗑️ Safely clearing internal logbook memory on {user_id}...")
                     erased = await wb.clear_logbook()
                     if erased:
                         cleared_sensors.append(user_id)
                         print(f"✅ Internal sensor memory successfully erased for {user_id}.")
                 else:
-                    print(f"⚠️ Log download incomplete for {user_id}. Sensor memory NOT cleared to prevent data loss.")
+                    print(f"⚠️ Download incomplete or no RR decoded for {user_id} "
+                          f"(complete={downloaded}, entries_found={entries_known}, rr={count}). "
+                          "Sensor memory NOT cleared to prevent data loss.")
 
             except Exception as e:
                 print(f"❌ Error stopping/downloading from {user_id}: {e}")
@@ -761,9 +906,20 @@ class MovesenseApp(QMainWindow):
                 await wb.disconnect()
                 await asyncio.sleep(0.5)
 
+        # Write the combined RR CSV (same format as v1: <session>.csv)
+        rr_filename = f"{self.session_id}.csv"
+        rr_rows.sort(key=lambda r: r[0])
+        with open(rr_filename, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Timestamp", "UserID", "HeartRate_bpm", "RR_Interval_ms"])
+            for ts, uid, hr, rr in rr_rows:
+                writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], uid, hr, rr])
+        rr_summary = ", ".join(f"{u}: {c}" for u, c in rr_counts.items()) or "None"
+
         summary_text = (
             f"Session '{self.session_id}' finished.\n\n"
             f"Events Logged: {self.event_counter - 1} ({self.session_id}_events.csv)\n\n"
+            f"RR Intervals ({rr_filename}): {rr_summary}\n\n"
             f"Downloaded Files:\n" + ("\n".join(f"- {f}" for f in downloaded_files) if downloaded_files else "None") + "\n\n"
             f"Sensors Safely Cleared: {', '.join(cleared_sensors) if cleared_sensors else 'None'}"
         )
