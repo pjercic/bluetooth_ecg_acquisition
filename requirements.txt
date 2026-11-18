@@ -1,0 +1,10 @@
+# Bluetooth ECG Acquisition & GUI
+bleak>=0.22.0
+PyQt6>=6.6.0
+qasync>=0.27.1
+
+# HRV Data Processing, Analysis & Visualization
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+neurokit2>=0.2.7
