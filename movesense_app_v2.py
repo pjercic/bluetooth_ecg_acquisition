@@ -12,7 +12,8 @@ from bleak import BleakClient, BleakScanner
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QListWidget, QMessageBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QPlainTextEdit)
+                             QTableWidgetItem, QHeaderView, QPlainTextEdit,
+                             QRadioButton, QButtonGroup, QGroupBox)
 from qasync import QEventLoop, asyncSlot
 from sbem_tools.parse_sbem import read_chunks
 
@@ -238,8 +239,8 @@ class MovesenseSensorClient:
             await self.client.disconnect()
         self.client = None
 
-    async def configure_and_start_logging(self) -> bool:
-        """Sets UTC time, configures DataLogger for ECG 125Hz + HR + Time, and starts logging."""
+    async def configure_and_start_logging(self, ecg_enabled: bool = True) -> bool:
+        """Sets UTC time, configures DataLogger (ECG optional + HR + Time), and starts logging."""
         utc_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
 
         if self.uses_gsp:
@@ -248,9 +249,10 @@ class MovesenseSensorClient:
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([8, 101]) + time_bytes, response=True)
             await asyncio.sleep(0.2)
 
-            # 2. Configure DataLogger: /Meas/ECG/125/mV + /Meas/HR + /Time/Detailed
+            # 2. Configure DataLogger: (ECG 125Hz optional) + /Meas/HR + /Time/Detailed
             config_data = bytearray([6, 102])
-            config_data.extend("/Meas/ECG/125/mV".encode() + b"\0")
+            if ecg_enabled:
+                config_data.extend("/Meas/ECG/125/mV".encode() + b"\0")
             config_data.extend("/Meas/HR".encode() + b"\0")
             config_data.extend("/Time/Detailed".encode() + b"\0")
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, config_data, response=True)
@@ -369,6 +371,7 @@ class MovesenseSensorClient:
                 print("⚠️ No ACK for FETCH_LOG, waiting for data stream...")
 
             chunks_received = 0
+            stream_ended_cleanly = False
             while True:
                 try:
                     packet = await asyncio.wait_for(self.download_queue.get(), timeout=timeout)
@@ -386,11 +389,20 @@ class MovesenseSensorClient:
                             print(f"🏁 End-of-file marker received ({chunks_received} packets, {len(downloaded)} bytes).")
                             if progress_callback:
                                 progress_callback(len(downloaded))
+                            stream_ended_cleanly = True
                             break
                 except asyncio.TimeoutError:
                     if chunks_received > 0:
                         print(f"⚠️ Stream pause/complete after {chunks_received} packets ({len(downloaded)} bytes).")
                     break
+
+            # If stream ended by timeout rather than EOF marker, give the BLE GATT layer
+            # a moment to settle before subsequent commands (avoids GATT Unlikely Error 0x0E)
+            if not stream_ended_cleanly and chunks_received > 0:
+                await asyncio.sleep(1.5)
+                # Drain any late-arriving packets
+                while not self.download_queue.empty():
+                    self.download_queue.get_nowait()
         else:
             # Whiteboard V9 download
             res_id = bytes([0x00, 0x34, 0x05])
@@ -419,18 +431,29 @@ class MovesenseSensorClient:
         return os.path.exists(target_filepath) and os.path.getsize(target_filepath) > 0
 
     async def clear_logbook(self) -> bool:
-        """Erases all stored logs from the sensor internal memory (CLEAR_LOGBOOK)."""
+        """Erases all stored logs from the sensor internal memory (CLEAR_LOGBOOK).
+        
+        Retries once if a transient GATT error occurs after a data transfer.
+        """
         if self.uses_gsp:
-            while not self.response_queue.empty():
-                self.response_queue.get_nowait()
-            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([5, 107]), response=True)
-            try:
-                resp = await asyncio.wait_for(self.response_queue.get(), timeout=6.0)
-                if len(resp) >= 4:
-                    status = struct.unpack("<H", resp[2:4])[0]
-                    return status in (200, 204)
-            except asyncio.TimeoutError:
-                return False
+            for attempt in range(2):
+                try:
+                    while not self.response_queue.empty():
+                        self.response_queue.get_nowait()
+                    await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([5, 107]), response=True)
+                    resp = await asyncio.wait_for(self.response_queue.get(), timeout=8.0)
+                    if len(resp) >= 4:
+                        status = struct.unpack("<H", resp[2:4])[0]
+                        return status in (200, 204)
+                except asyncio.TimeoutError:
+                    return False
+                except Exception as e:
+                    if attempt == 0:
+                        print(f"⚠️ Clear attempt {attempt+1} failed ({type(e).__name__}), retrying after 2s...")
+                        await asyncio.sleep(2.0)
+                    else:
+                        print(f"❌ Clear failed after retry: {type(e).__name__}: {e}")
+                        return False
         else:
             payload = RES_ID_LOGBOOK_ENTRIES + bytes([0x01, 0x00, 0x00, 0x00])
             header = bytes([0xA5, WB_MSG_PROVIDER_DELETE_REQUEST, len(payload), 0x00, 0x07, 0x00])
@@ -451,8 +474,9 @@ class MovesenseSensorClient:
 # SBEM Log Parser & CSV Exporter
 # ==============================================================================
 
-async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str, hr_csv_path: str) -> Dict[str, int]:
-    """Parses raw Movesense SBEM file and exports calibrated ECG and HR/RR to CSV."""
+async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str, hr_csv_path: str,
+                             ecg_enabled: bool = True) -> Dict[str, int]:
+    """Parses raw Movesense SBEM file and exports calibrated ECG (optional) and HR/RR to CSV."""
     base_rel_ms = None
     base_utc_us = None
     ecg_samples = []
@@ -480,15 +504,17 @@ async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str
         print(f"⚠️ Error reading SBEM chunks from {sbem_filepath}: {e}")
 
     start_dt = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc) if base_utc_us else datetime.now(timezone.utc)
+    # Use first HR timestamp as base if no ECG present
     base_ms = base_rel_ms if base_rel_ms is not None else (ecg_samples[0][0] if ecg_samples else 0)
 
-    # 1. Write ECG CSV
-    with open(ecg_csv_path, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "UserID", "SampleIndex", "ECG_mV"])
-        for idx, (t_ms, mv) in enumerate(ecg_samples):
-            dt = start_dt + timedelta(milliseconds=(t_ms - base_ms))
-            writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], user_id, idx, f"{mv:.4f}"])
+    # 1. Write ECG CSV (only if ECG data was recorded)
+    if ecg_enabled and ecg_samples:
+        with open(ecg_csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "UserID", "SampleIndex", "ECG_mV"])
+            for idx, (t_ms, mv) in enumerate(ecg_samples):
+                dt = start_dt + timedelta(milliseconds=(t_ms - base_ms))
+                writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], user_id, idx, f"{mv:.4f}"])
 
     # 2. Write HR / RR CSV
     rr_count = 0
@@ -521,6 +547,7 @@ class MovesenseApp(QMainWindow):
         self.is_recording = False
         self.session_id = ""
         self.event_counter = 1
+        self.ecg_enabled = False  # Default: HR/RR only (faster, smaller files)
 
         self.init_ui()
 
@@ -574,11 +601,35 @@ class MovesenseApp(QMainWindow):
         ready_btn_layout.addWidget(self.remove_all_btn)
         main_layout.addLayout(ready_btn_layout)
 
+        # --- Recording Mode Selector ---
+        mode_group = QGroupBox("Recording Mode")
+        mode_layout = QHBoxLayout(mode_group)
+        self.mode_btn_group = QButtonGroup(self)
+        self.radio_hr_only = QRadioButton("💓 HR / RR only  (small file, fast download)")
+        self.radio_hr_only.setChecked(True)
+        self.radio_full = QRadioButton("📈 ECG + HR / RR  (full waveform, large file)")
+        self.radio_hr_only.setToolTip(
+            "Records only heart rate and RR intervals.\n"
+            "~97% smaller file than full ECG mode.\n"
+            "Recommended for HRV analysis."
+        )
+        self.radio_full.setToolTip(
+            "Records the raw ECG waveform at 125 Hz plus HR/RR.\n"
+            "Produces a ~170 KB SBEM file per 10 minutes.\n"
+            "Use when you need the raw ECG signal."
+        )
+        self.mode_btn_group.addButton(self.radio_hr_only, 0)
+        self.mode_btn_group.addButton(self.radio_full, 1)
+        self.radio_hr_only.toggled.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.radio_hr_only)
+        mode_layout.addWidget(self.radio_full)
+        main_layout.addWidget(mode_group)
+
         # --- Recording Controls ---
         rec_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ START WHITEBOARD RECORDING")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
-        self.start_btn.clicked.connect(self.start_recording) 
+        self.start_btn.clicked.connect(self.start_recording)
 
         self.stop_btn = QPushButton("⏹ STOP & DOWNLOAD LOGS")
         self.stop_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; padding: 10px;")
@@ -618,6 +669,10 @@ class MovesenseApp(QMainWindow):
         sb = self.log_console.verticalScrollBar()
         if sb:
             sb.setValue(sb.maximum())
+
+    def _on_mode_changed(self):
+        """Updates ecg_enabled state when recording mode radio changes."""
+        self.ecg_enabled = self.radio_full.isChecked()
 
     def remove_selected_sensor(self):
         selected_row = self.sensor_list_ui.currentRow()
@@ -759,6 +814,9 @@ class MovesenseApp(QMainWindow):
         self.add_all_btn.setEnabled(False)
         self.remove_all_btn.setEnabled(False)
         self.remove_selected_btn.setEnabled(False)
+        # Lock mode selector for duration of session
+        self.radio_hr_only.setEnabled(False)
+        self.radio_full.setEnabled(False)
 
         # Initialize event marker CSV
         events_filename = f"{self.session_id}_events.csv"
@@ -769,7 +827,8 @@ class MovesenseApp(QMainWindow):
         self.event_counter = 1
         self.add_event_btn.setText("📍 Add Event (Event1)")
         self.add_event_btn.setEnabled(True)
-        self.event_status_label.setText("Starting Whiteboard DataLogger on sensors...")
+        mode_label = "ECG + HR/RR" if self.ecg_enabled else "HR/RR only"
+        self.event_status_label.setText(f"Starting DataLogger on sensors [{mode_label}]...")
 
         started_sensors = []
         failed_sensors = []
@@ -785,11 +844,12 @@ class MovesenseApp(QMainWindow):
             try:
                 await client.connect()
                 self.log(f"✅ Connected to {user_id} (Protocol: {'GSP' if client.uses_gsp else 'Whiteboard V9'})")
-                
-                self.log(f"🚀 Configuring DataLogger (ECG + HR + Time) and starting logging on {user_id}...")
-                ok = await client.configure_and_start_logging()
+
+                streams = "ECG 125Hz + HR/RR + Time" if self.ecg_enabled else "HR/RR + Time"
+                self.log(f"🚀 Configuring DataLogger ({streams}) and starting logging on {user_id}...")
+                ok = await client.configure_and_start_logging(ecg_enabled=self.ecg_enabled)
                 if ok:
-                    self.log(f"✅ {user_id} DataLogger is now LOGGING internally.")
+                    self.log(f"✅ {user_id} DataLogger is now LOGGING internally [{mode_label}].")
                     started_sensors.append(user_id)
                 else:
                     self.log(f"❌ {user_id} failed to transition to LOGGING.")
@@ -815,6 +875,8 @@ class MovesenseApp(QMainWindow):
             self.remove_all_btn.setEnabled(True)
             self.remove_selected_btn.setEnabled(True)
             self.add_event_btn.setEnabled(False)
+            self.radio_hr_only.setEnabled(True)
+            self.radio_full.setEnabled(True)
             self.event_status_label.setText("Ready.")
             return
 
@@ -875,10 +937,20 @@ class MovesenseApp(QMainWindow):
                 if file_size > 0:
                     self.log(f"✅ Verified log download: {target_sbem} ({file_size} bytes).")
                     self.event_status_label.setText(f"Parsing & exporting CSV for {user_id}...")
-                    counts = await export_sbem_to_csv(target_sbem, user_id, target_ecg_csv, target_hr_csv)
-                    self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
-
-                    downloaded_files.append(f"{target_sbem} ({file_size} bytes, {counts['ecg_count']} ECG, {counts['rr_count']} RR)")
+                    counts = await export_sbem_to_csv(
+                        target_sbem, user_id, target_ecg_csv, target_hr_csv,
+                        ecg_enabled=self.ecg_enabled
+                    )
+                    if self.ecg_enabled:
+                        self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
+                        downloaded_files.append(
+                            f"{target_sbem} ({file_size} bytes, {counts['ecg_count']} ECG, {counts['rr_count']} RR)"
+                        )
+                    else:
+                        self.log(f"📊 Extracted {counts['rr_count']} RR intervals (HR/RR only mode).")
+                        downloaded_files.append(
+                            f"{target_sbem} ({file_size} bytes, {counts['rr_count']} RR intervals)"
+                        )
 
                     # 5. Safe Memory Erase
                     self.log(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
@@ -916,6 +988,8 @@ class MovesenseApp(QMainWindow):
         self.add_all_btn.setEnabled(True)
         self.remove_all_btn.setEnabled(True)
         self.remove_selected_btn.setEnabled(True)
+        self.radio_hr_only.setEnabled(True)
+        self.radio_full.setEnabled(True)
 
 
 if __name__ == "__main__":
