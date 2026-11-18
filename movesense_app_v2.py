@@ -5,15 +5,31 @@ import re
 import zlib
 import struct
 import asyncio
+import subprocess
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Callable
 from bleak import BleakClient, BleakScanner
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QListWidget, QMessageBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView)
+                             QTableWidgetItem, QHeaderView, QPlainTextEdit)
 from qasync import QEventLoop, asyncSlot
 from sbem_tools.parse_sbem import read_chunks
+
+# Suppress harmless Wayland focus warnings on Linux desktop
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
+
+
+def ensure_bluetooth_powered(cycle: bool = False):
+    """Ensures host Bluetooth controller is powered on via bluetoothctl."""
+    try:
+        if cycle:
+            subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, timeout=1.5)
+            subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=1.5)
+        else:
+            subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=1.5)
+    except Exception:
+        pass
 
 # ==============================================================================
 # Movesense BLE UUIDs & Protocol Constants
@@ -158,8 +174,21 @@ class MovesenseSensorClient:
 
     async def connect(self, timeout: float = 12.0) -> bool:
         """Connects to sensor, auto-detects GSP vs Whiteboard V9, and performs handshake."""
-        self.client = BleakClient(self.mac, timeout=timeout)
-        await self.client.connect()
+        last_err = None
+        for attempt in range(2):
+            try:
+                self.client = BleakClient(self.mac, timeout=timeout)
+                await self.client.connect()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    ensure_bluetooth_powered(cycle=True)
+                    await asyncio.sleep(1.2)
+
+        if last_err is not None:
+            raise last_err
 
         # Check for GSP service
         service_uuids = [s.uuid.lower() for s in self.client.services]
@@ -283,26 +312,40 @@ class MovesenseSensorClient:
         return False
 
     async def get_latest_log_id(self) -> int:
-        """Queries /Mem/Logbook/Entries to determine the latest recorded log ID."""
+        """Queries /Mem/Logbook/entries to determine the latest recorded log ID."""
         if self.uses_gsp:
             while not self.response_queue.empty():
                 self.response_queue.get_nowait()
-            cmd = bytearray([4, 105] + list("/Mem/Logbook/Entries".encode()))
+            cmd = bytearray([4, 105]) + b"/Mem/Logbook/entries\x00"
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, cmd, response=True)
             try:
                 resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
-                if len(resp) >= 9:
-                    count = resp[4]
-                    if count > 0 and len(resp) >= 13:
-                        return struct.unpack("<I", resp[5:9])[0]
+                if len(resp) >= 5 and resp[0] == 1:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    if status == 200:
+                        count = resp[4]
+                        entry_data = resp[5:]
+                        log_ids = []
+                        for i in range(0, len(entry_data), 16):
+                            chunk = entry_data[i:i+16]
+                            if len(chunk) == 16:
+                                eid = struct.unpack("<I", chunk[0:4])[0]
+                                log_ids.append(eid)
+                        if log_ids:
+                            latest = max(log_ids)
+                            print(f"📋 Found {count} log entries on sensor: IDs {log_ids}, selecting latest ID {latest}")
+                            return latest
             except asyncio.TimeoutError:
-                pass
+                print("⚠️ Timeout querying /Mem/Logbook/entries")
         return 1
 
-    async def download_log_data(self, log_id: int, target_filepath: str, timeout: float = 25.0) -> bool:
+    async def download_log_data(self, log_id: int, target_filepath: str, timeout: float = 20.0, 
+                                progress_callback: Optional[Callable[[int], None]] = None) -> bool:
         """Downloads log file from sensor, verifying high-speed chunk stream until end marker."""
         while not self.download_queue.empty():
             self.download_queue.get_nowait()
+        while not self.response_queue.empty():
+            self.response_queue.get_nowait()
         self.download_done.clear()
 
         dirname = os.path.dirname(target_filepath)
@@ -314,6 +357,18 @@ class MovesenseSensorClient:
         if self.uses_gsp:
             cmd = bytearray([3, 106]) + struct.pack("<I", log_id)
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, cmd, response=True)
+            # Check FETCH_LOG command acknowledgement
+            try:
+                init_resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(init_resp) >= 4 and init_resp[0] == 1:
+                    status = struct.unpack("<H", init_resp[2:4])[0]
+                    if status != 200:
+                        print(f"❌ FETCH_LOG returned error status {status} for log ID {log_id}")
+                        return False
+            except asyncio.TimeoutError:
+                print("⚠️ No ACK for FETCH_LOG, waiting for data stream...")
+
+            chunks_received = 0
             while True:
                 try:
                     packet = await asyncio.wait_for(self.download_queue.get(), timeout=timeout)
@@ -321,12 +376,20 @@ class MovesenseSensorClient:
                         offset = struct.unpack("<I", packet[2:6])[0]
                         chunk = packet[6:]
                         if len(chunk) > 0:
+                            chunks_received += 1
                             if len(downloaded) < offset + len(chunk):
                                 downloaded.extend(b"\0" * (offset + len(chunk) - len(downloaded)))
                             downloaded[offset:offset + len(chunk)] = chunk
+                            if progress_callback and chunks_received % 25 == 0:
+                                progress_callback(len(downloaded))
                         else:
-                            break  # End-of-file marker received
+                            print(f"🏁 End-of-file marker received ({chunks_received} packets, {len(downloaded)} bytes).")
+                            if progress_callback:
+                                progress_callback(len(downloaded))
+                            break
                 except asyncio.TimeoutError:
+                    if chunks_received > 0:
+                        print(f"⚠️ Stream pause/complete after {chunks_received} packets ({len(downloaded)} bytes).")
                     break
         else:
             # Whiteboard V9 download
@@ -540,6 +603,22 @@ class MovesenseApp(QMainWindow):
         self.event_status_label.setStyleSheet("color: #666; font-style: italic;")
         main_layout.addWidget(self.event_status_label)
 
+        # --- Activity Log Console ---
+        main_layout.addWidget(QLabel("--- Activity Log ---"))
+        self.log_console = QPlainTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumHeight(150)
+        self.log_console.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 11px;")
+        main_layout.addWidget(self.log_console)
+
+    def log(self, text: str):
+        """Prints to console and appends to GUI Activity Log."""
+        print(text)
+        self.log_console.appendPlainText(text)
+        sb = self.log_console.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
     def remove_selected_sensor(self):
         selected_row = self.sensor_list_ui.currentRow()
         if 0 <= selected_row < len(self.sensors_to_connect):
@@ -580,6 +659,7 @@ class MovesenseApp(QMainWindow):
 
     @asyncSlot()
     async def scan_sensors(self):
+        ensure_bluetooth_powered()
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning... Please wait 5 seconds...")
         self.scanned_table.setRowCount(0)
@@ -698,29 +778,30 @@ class MovesenseApp(QMainWindow):
         for sensor in self.sensors_to_connect:
             user_id = sensor['user']
             mac = sensor['mac']
-            print(f"\n🔄 Connecting to {user_id} ({mac}) via Whiteboard...")
+            self.log(f"\n🔄 Connecting to {user_id} ({mac}) via Whiteboard...")
             self.event_status_label.setText(f"Starting DataLogger on {user_id} ({mac})...")
 
             client = MovesenseSensorClient(mac)
             try:
                 await client.connect()
-                print(f"✅ Connected to {user_id} (Protocol: {'GSP' if client.uses_gsp else 'Whiteboard V9'})")
+                self.log(f"✅ Connected to {user_id} (Protocol: {'GSP' if client.uses_gsp else 'Whiteboard V9'})")
                 
-                print(f"🚀 Configuring DataLogger (ECG + HR + Time) and starting logging on {user_id}...")
+                self.log(f"🚀 Configuring DataLogger (ECG + HR + Time) and starting logging on {user_id}...")
                 ok = await client.configure_and_start_logging()
                 if ok:
-                    print(f"✅ {user_id} DataLogger is now LOGGING internally.")
+                    self.log(f"✅ {user_id} DataLogger is now LOGGING internally.")
                     started_sensors.append(user_id)
                 else:
-                    print(f"❌ {user_id} failed to transition to LOGGING.")
+                    self.log(f"❌ {user_id} failed to transition to LOGGING.")
                     failed_sensors.append(user_id)
             except Exception as e:
-                print(f"❌ Failed to start {user_id}: {e}")
+                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self.log(f"❌ Failed to start {user_id}: {err_desc}")
                 failed_sensors.append(user_id)
             finally:
                 # Disconnect BLE so the sensor logs in low-power mode
                 await client.disconnect()
-                print(f"🔌 BLE disconnected for {user_id} (Operating autonomously in Low-Power mode).")
+                self.log(f"🔌 BLE disconnected for {user_id} (Operating autonomously in Low-Power mode).")
                 await asyncio.sleep(0.5)
 
         if not started_sensors:
@@ -741,11 +822,12 @@ class MovesenseApp(QMainWindow):
         if failed_sensors:
             status_text += f" | Failed: {', '.join(failed_sensors)}"
         self.event_status_label.setText(status_text)
-        print(f"\n🎉 Session '{self.session_id}' is active! Sensors are recording internally in low-power mode.")
+        self.log(f"\n🎉 Session '{self.session_id}' is active! Sensors are recording internally in low-power mode.")
 
     @asyncSlot()
     async def stop_recording(self):
         """Reconnects, stops DataLogger, downloads SBEM logs, verifies integrity, exports CSVs, and safely clears sensor memory."""
+        ensure_bluetooth_powered()
         self.is_recording = False
         self.stop_btn.setEnabled(False)
         self.add_event_btn.setEnabled(False)
@@ -757,54 +839,61 @@ class MovesenseApp(QMainWindow):
         for sensor in self.sensors_to_connect:
             user_id = sensor['user']
             mac = sensor['mac']
-            print(f"\n🔄 Reconnecting to {user_id} ({mac}) to stop logging & retrieve data...")
-            self.event_status_label.setText(f"Retrieving data from {user_id} ({mac})...")
+            self.log(f"\n🔄 Reconnecting to {user_id} ({mac}) to stop logging & retrieve data...")
+            self.event_status_label.setText(f"Reconnecting to {user_id} ({mac})...")
 
             client = MovesenseSensorClient(mac)
             try:
                 await client.connect()
-                print(f"✅ Connected to {user_id}.")
+                self.log(f"✅ Connected to {user_id}.")
 
                 # 1. Stop DataLogger (State 2 = DATALOGGER_READY)
-                print(f"⏹ Stopping DataLogger on {user_id}...")
+                self.log(f"⏹ Stopping DataLogger on {user_id}...")
                 await client.stop_logging()
                 await asyncio.sleep(0.4)
 
                 # 2. Get latest log ID
                 log_id = await client.get_latest_log_id()
-                print(f"📋 Target Log ID: {log_id}")
+                self.log(f"📋 Target Log ID: {log_id}")
 
                 # 3. Download raw SBEM log file
                 target_sbem = f"{self.session_id}_{sanitize_filename_part(user_id)}.sbem"
                 target_ecg_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_ecg.csv"
                 target_hr_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_hr_rr.csv"
 
-                print(f"📥 Downloading Log ID {log_id} to {target_sbem}...")
-                success = await client.download_log_data(log_id, target_sbem)
+                self.log(f"📥 Downloading Log ID {log_id} to {target_sbem}...")
+                self.event_status_label.setText(f"📥 Downloading Log ID {log_id} from {user_id}...")
+                
+                def on_progress(bytes_dl):
+                    self.event_status_label.setText(f"📥 Downloading {user_id}: {bytes_dl / 1024:.1f} KB received...")
+
+                success = await client.download_log_data(log_id, target_sbem, progress_callback=on_progress)
 
                 # 4. Integrity Verification & CSV Export
                 file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and success) else 0
 
                 if file_size > 0:
-                    print(f"✅ Verified log download: {target_sbem} ({file_size} bytes).")
+                    self.log(f"✅ Verified log download: {target_sbem} ({file_size} bytes).")
+                    self.event_status_label.setText(f"Parsing & exporting CSV for {user_id}...")
                     counts = await export_sbem_to_csv(target_sbem, user_id, target_ecg_csv, target_hr_csv)
-                    print(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
+                    self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
 
                     downloaded_files.append(f"{target_sbem} ({file_size} bytes, {counts['ecg_count']} ECG, {counts['rr_count']} RR)")
 
                     # 5. Safe Memory Erase
-                    print(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
+                    self.log(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
                     erased = await client.clear_logbook()
                     if erased:
                         cleared_sensors.append(user_id)
-                        print(f"✅ Sensor memory cleared successfully for {user_id}.")
+                        self.log(f"✅ Sensor memory cleared successfully for {user_id}.")
                     else:
-                        print(f"⚠️ Erase command unacknowledged by {user_id}.")
+                        self.log(f"⚠️ Erase command unacknowledged by {user_id}.")
                 else:
-                    print(f"⚠️ Download incomplete or empty for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
+                    self.log(f"⚠️ Download incomplete or empty for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
 
             except Exception as e:
-                print(f"❌ Error during stop/retrieve for {user_id}: {e}")
+                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self.log(f"❌ Error during stop/retrieve for {user_id}: {err_desc}")
             finally:
                 await client.disconnect()
                 await asyncio.sleep(0.5)
