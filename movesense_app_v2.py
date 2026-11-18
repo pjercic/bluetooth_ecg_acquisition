@@ -6,8 +6,9 @@ import zlib
 import struct
 import asyncio
 import subprocess
+import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Any, Callable
+from typing import Optional, Dict, List, Any, Callable, Tuple
 from bleak import BleakClient, BleakScanner
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
@@ -239,17 +240,52 @@ class MovesenseSensorClient:
             await self.client.disconnect()
         self.client = None
 
-    async def configure_and_start_logging(self, ecg_enabled: bool = True) -> bool:
-        """Sets UTC time, configures DataLogger (ECG optional + HR + Time), and starts logging."""
-        utc_us = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
-
+    async def sync_utc_time(self) -> Tuple[bool, float]:
+        """Sets UTC time on sensor, measuring and compensating for BLE round-trip latency."""
         if self.uses_gsp:
-            # 1. Set UTC Time
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            t0 = time.time()
+            utc_us = int(t0 * 1_000_000)
             time_bytes = struct.pack("<Q", utc_us)
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([8, 101]) + time_bytes, response=True)
-            await asyncio.sleep(0.2)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=4.0)
+                t1 = time.time()
+                rtt_ms = (t1 - t0) * 1000.0
+                status = struct.unpack("<H", resp[2:4])[0] if len(resp) >= 4 else 0
+                return (status in (200, 204), rtt_ms)
+            except asyncio.TimeoutError:
+                return (False, 0.0)
+        return (True, 0.0)
 
-            # 2. Configure DataLogger: (ECG 125Hz optional) + /Meas/HR + /Time/Detailed
+    async def get_time_detailed(self) -> Optional[Dict[str, Any]]:
+        """Queries /Time/Detailed to obtain paired UTC time, relative ticks, and tick rate."""
+        if self.uses_gsp:
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            t_host = time.time()
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([4, 110]) + b"/Time/Detailed\x00", response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=4.0)
+                if len(resp) >= 4:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    if status == 200 and len(resp) >= 20:
+                        utc_us, rel_ms, tick_rate = struct.unpack("<QII", resp[4:20])
+                        return {
+                            "utc_us": utc_us,
+                            "rel_ms": rel_ms,
+                            "tick_rate": tick_rate,
+                            "host_time": t_host,
+                        }
+            except asyncio.TimeoutError:
+                pass
+        return None
+
+    async def configure_and_start_logging(self, ecg_enabled: bool = True) -> bool:
+        """Configures DataLogger (ECG optional + HR + Time) and starts logging."""
+        if self.uses_gsp:
+            # 1. Configure DataLogger: (ECG 125Hz optional) + /Meas/HR + /Time/Detailed
             config_data = bytearray([6, 102])
             if ecg_enabled:
                 config_data.extend("/Meas/ECG/125/mV".encode() + b"\0")
@@ -475,8 +511,10 @@ class MovesenseSensorClient:
 # ==============================================================================
 
 async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str, hr_csv_path: str,
-                             ecg_enabled: bool = True) -> Dict[str, int]:
-    """Parses raw Movesense SBEM file and exports calibrated ECG (optional) and HR/RR to CSV."""
+                             ecg_enabled: bool = True, drift_rate: float = 1.0) -> Dict[str, int]:
+    """Parses raw Movesense SBEM file and exports calibrated ECG (optional) and HR/RR to CSV
+    using ISO-8601 timestamps with timezone offsets and linear drift compensation.
+    """
     base_rel_ms = None
     base_utc_us = None
     ecg_samples = []
@@ -503,30 +541,39 @@ async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str
     except Exception as e:
         print(f"⚠️ Error reading SBEM chunks from {sbem_filepath}: {e}")
 
-    start_dt = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc) if base_utc_us else datetime.now(timezone.utc)
-    # Use first HR timestamp as base if no ECG present
+    start_dt_utc = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc) if base_utc_us else datetime.now(timezone.utc)
+    # Convert to host local timezone with explicit offset (e.g. +01:00)
+    start_dt_local = start_dt_utc.astimezone()
+
+    # Use relative time anchor from chunk 107 or first sample
     base_ms = base_rel_ms if base_rel_ms is not None else (ecg_samples[0][0] if ecg_samples else 0)
 
     # 1. Write ECG CSV (only if ECG data was recorded)
     if ecg_enabled and ecg_samples:
         with open(ecg_csv_path, mode='w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "UserID", "SampleIndex", "ECG_mV"])
+            writer.writerow(["Timestamp", "UserID", "SampleIndex", "ECG_mV", "Elapsed_Seconds"])
             for idx, (t_ms, mv) in enumerate(ecg_samples):
-                dt = start_dt + timedelta(milliseconds=(t_ms - base_ms))
-                writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], user_id, idx, f"{mv:.4f}"])
+                elapsed_ms = (t_ms - base_ms) * drift_rate
+                dt = start_dt_local + timedelta(milliseconds=elapsed_ms)
+                iso_ts = dt.isoformat(timespec='milliseconds')
+                elapsed_s = f"{elapsed_ms / 1000.0:.3f}"
+                writer.writerow([iso_ts, user_id, idx, f"{mv:.4f}", elapsed_s])
 
     # 2. Write HR / RR CSV
     rr_count = 0
     t_rr_ms = base_ms
     with open(hr_csv_path, mode='w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["Timestamp", "UserID", "HeartRate_bpm", "RR_Interval_ms"])
+        writer.writerow(["Timestamp", "UserID", "HeartRate_bpm", "RR_Interval_ms", "Elapsed_Seconds"])
         for hr, rrs in hr_samples:
             for rr in rrs:
                 t_rr_ms += rr
-                dt = start_dt + timedelta(milliseconds=(t_rr_ms - base_ms))
-                writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3], user_id, f"{hr:.1f}", rr])
+                elapsed_ms = (t_rr_ms - base_ms) * drift_rate
+                dt = start_dt_local + timedelta(milliseconds=elapsed_ms)
+                iso_ts = dt.isoformat(timespec='milliseconds')
+                elapsed_s = f"{elapsed_ms / 1000.0:.3f}"
+                writer.writerow([iso_ts, user_id, f"{hr:.1f}", rr, elapsed_s])
                 rr_count += 1
 
     return {'ecg_count': len(ecg_samples), 'rr_count': rr_count}
@@ -546,6 +593,8 @@ class MovesenseApp(QMainWindow):
         self.sensors_to_connect = [] 
         self.is_recording = False
         self.session_id = ""
+        self.session_start_time = None
+        self.sensor_time_anchors = {}
         self.event_counter = 1
         self.ecg_enabled = False  # Default: HR/RR only (faster, smaller files)
 
@@ -685,25 +734,28 @@ class MovesenseApp(QMainWindow):
         self.sensor_list_ui.clear()
 
     def add_event(self):
-        """Logs an event marker with current timestamp and incremented Event#."""
+        """Logs an event marker with current ISO-8601 timestamp and incremented Event#."""
         if not self.is_recording:
             return
 
         event_name = f"Event{self.event_counter}"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        now_dt = datetime.now().astimezone()
+        timestamp = now_dt.isoformat(timespec='milliseconds')
+        elapsed_s = f"{(time.time() - self.session_start_time):.3f}" if self.session_start_time else "0.000"
         events_filename = f"{self.session_id}_events.csv"
 
         try:
             with open(events_filename, mode='a', newline='') as file:
                 writer = csv.writer(file)
-                writer.writerow([timestamp, event_name])
+                writer.writerow([timestamp, event_name, elapsed_s])
 
-            print(f"[{timestamp}] 📍 Logged {event_name}")
-            self.event_status_label.setText(f"✅ Last logged: {event_name} at {timestamp.split(' ')[1]}")
+            self.log(f"[{timestamp}] 📍 Logged {event_name} (Elapsed: {elapsed_s}s)")
+            display_time = timestamp.split('T')[1] if 'T' in timestamp else timestamp
+            self.event_status_label.setText(f"✅ Last logged: {event_name} at {display_time}")
             self.event_counter += 1
             self.add_event_btn.setText(f"📍 Add Event (Event{self.event_counter})")
         except Exception as e:
-            print(f"❌ Failed to log event: {e}")
+            self.log(f"❌ Failed to log event: {e}")
             self.event_status_label.setText(f"❌ Error logging event: {e}")
 
     def get_next_default_user_id(self, existing_ids):
@@ -822,8 +874,10 @@ class MovesenseApp(QMainWindow):
         events_filename = f"{self.session_id}_events.csv"
         with open(events_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Timestamp", "Event"])
+            writer.writerow(["Timestamp", "Event", "Elapsed_Seconds"])
 
+        self.session_start_time = time.time()
+        self.sensor_time_anchors = {}
         self.event_counter = 1
         self.add_event_btn.setText("📍 Add Event (Event1)")
         self.add_event_btn.setEnabled(True)
@@ -844,6 +898,15 @@ class MovesenseApp(QMainWindow):
             try:
                 await client.connect()
                 self.log(f"✅ Connected to {user_id} (Protocol: {'GSP' if client.uses_gsp else 'Whiteboard V9'})")
+
+                # Pre-flight time sync & anchor
+                synced, rtt_ms = await client.sync_utc_time()
+                if synced:
+                    self.log(f"⏱️ Sensor {user_id} clock synchronized with host (one-way BLE latency: {rtt_ms/2:.1f} ms)")
+
+                start_anchor = await client.get_time_detailed()
+                if start_anchor:
+                    self.sensor_time_anchors[user_id] = {'start': start_anchor}
 
                 streams = "ECG 125Hz + HR/RR + Time" if self.ecg_enabled else "HR/RR + Time"
                 self.log(f"🚀 Configuring DataLogger ({streams}) and starting logging on {user_id}...")
@@ -909,16 +972,30 @@ class MovesenseApp(QMainWindow):
                 await client.connect()
                 self.log(f"✅ Connected to {user_id}.")
 
-                # 1. Stop DataLogger (State 2 = DATALOGGER_READY)
+                # 1. Post-flight time anchor for clock drift compensation
+                stop_anchor = await client.get_time_detailed()
+                drift_rate = 1.0
+                start_anchor = self.sensor_time_anchors.get(user_id, {}).get('start')
+
+                if start_anchor and stop_anchor:
+                    delta_host = stop_anchor['host_time'] - start_anchor['host_time']
+                    delta_sensor = (stop_anchor['rel_ms'] - start_anchor['rel_ms']) / 1000.0
+                    if delta_host > 5.0 and delta_sensor > 0.0:
+                        drift_rate = delta_host / delta_sensor
+                        drift_ms = (delta_sensor - delta_host) * 1000.0
+                        drift_ppm = (drift_rate - 1.0) * 1_000_000.0
+                        self.log(f"⏱️ Clock drift analysis for {user_id}: host ΔT={delta_host:.2f}s, sensor ΔT={delta_sensor:.2f}s (drift: {drift_ms:+.1f} ms, {drift_ppm:+.1f} ppm)")
+
+                # 2. Stop DataLogger (State 2 = DATALOGGER_READY)
                 self.log(f"⏹ Stopping DataLogger on {user_id}...")
                 await client.stop_logging()
                 await asyncio.sleep(0.4)
 
-                # 2. Get latest log ID
+                # 3. Get latest log ID
                 log_id = await client.get_latest_log_id()
                 self.log(f"📋 Target Log ID: {log_id}")
 
-                # 3. Download raw SBEM log file
+                # 4. Download raw SBEM log file
                 target_sbem = f"{self.session_id}_{sanitize_filename_part(user_id)}.sbem"
                 target_ecg_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_ecg.csv"
                 target_hr_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_hr_rr.csv"
@@ -931,7 +1008,7 @@ class MovesenseApp(QMainWindow):
 
                 success = await client.download_log_data(log_id, target_sbem, progress_callback=on_progress)
 
-                # 4. Integrity Verification & CSV Export
+                # 5. Integrity Verification & CSV Export
                 file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and success) else 0
 
                 if file_size > 0:
@@ -939,7 +1016,8 @@ class MovesenseApp(QMainWindow):
                     self.event_status_label.setText(f"Parsing & exporting CSV for {user_id}...")
                     counts = await export_sbem_to_csv(
                         target_sbem, user_id, target_ecg_csv, target_hr_csv,
-                        ecg_enabled=self.ecg_enabled
+                        ecg_enabled=self.ecg_enabled,
+                        drift_rate=drift_rate
                     )
                     if self.ecg_enabled:
                         self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
