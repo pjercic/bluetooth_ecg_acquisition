@@ -186,8 +186,7 @@ class MovesenseSensorClient:
             except Exception as e:
                 last_err = e
                 if attempt == 0:
-                    ensure_bluetooth_powered(cycle=True)
-                    await asyncio.sleep(1.2)
+                    await asyncio.sleep(2.0)
 
         if last_err is not None:
             raise last_err
@@ -286,25 +285,40 @@ class MovesenseSensorClient:
         """Configures DataLogger (ECG optional + HR + Time) and starts logging."""
         if self.uses_gsp:
             # 1. Configure DataLogger: (ECG 125Hz optional) + /Meas/HR + /Time/Detailed
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
             config_data = bytearray([6, 102])
             if ecg_enabled:
                 config_data.extend("/Meas/ECG/125/mV".encode() + b"\0")
             config_data.extend("/Meas/HR".encode() + b"\0")
             config_data.extend("/Time/Detailed".encode() + b"\0")
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, config_data, response=True)
+            try:
+                await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
             await asyncio.sleep(0.2)
 
-            # 3. Start DataLogger (State 3 = DATALOGGER_LOGGING)
+            # 2. Start DataLogger (State 3 = DATALOGGER_LOGGING)
             while not self.response_queue.empty():
                 self.response_queue.get_nowait()
             await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([9, 103, 3]), response=True)
+            started = False
             try:
                 resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
                 if len(resp) >= 4:
                     status = struct.unpack("<H", resp[2:4])[0]
-                    return status in (200, 202)
+                    started = status in (200, 202)
             except asyncio.TimeoutError:
                 return False
+
+            if started:
+                # Trigger a time sync now that DataLogger is actively LOGGING
+                # so the sensor firmware immediately writes chunk 107 (TimeDetailed) into flash
+                await asyncio.sleep(0.1)
+                await self.sync_utc_time()
+
+            return started
         else:
             # Whiteboard V9 implementation
             payload = RES_ID_DATALOGGER_STATE + bytes([0x01, 0x00, 0x00, 0x01, 0x03, 0x00, 0x03])
@@ -349,8 +363,8 @@ class MovesenseSensorClient:
 
         return False
 
-    async def get_latest_log_id(self) -> int:
-        """Queries /Mem/Logbook/entries to determine the latest recorded log ID."""
+    async def get_latest_log_id(self) -> Tuple[int, int]:
+        """Queries /Mem/Logbook/entries to determine the latest recorded log ID and expected size."""
         if self.uses_gsp:
             while not self.response_queue.empty():
                 self.response_queue.get_nowait()
@@ -363,21 +377,23 @@ class MovesenseSensorClient:
                     if status == 200:
                         count = resp[4]
                         entry_data = resp[5:]
-                        log_ids = []
+                        entries = []
                         for i in range(0, len(entry_data), 16):
                             chunk = entry_data[i:i+16]
                             if len(chunk) == 16:
                                 eid = struct.unpack("<I", chunk[0:4])[0]
-                                log_ids.append(eid)
-                        if log_ids:
-                            latest = max(log_ids)
-                            print(f"📋 Found {count} log entries on sensor: IDs {log_ids}, selecting latest ID {latest}")
-                            return latest
+                                size = struct.unpack("<I", chunk[8:12])[0]
+                                entries.append((eid, size))
+                        if entries:
+                            latest_id, expected_size = max(entries, key=lambda x: x[0])
+                            print(f"📋 Found {count} log entries on sensor: IDs {[e[0] for e in entries]}, selecting latest ID {latest_id} (expected size: {expected_size} bytes)")
+                            return latest_id, expected_size
             except asyncio.TimeoutError:
                 print("⚠️ Timeout querying /Mem/Logbook/entries")
-        return 1
+        return 1, 0
 
-    async def download_log_data(self, log_id: int, target_filepath: str, timeout: float = 20.0, 
+    async def download_log_data(self, log_id: int, target_filepath: str, expected_size: int = 0,
+                                timeout: float = 8.0, 
                                 progress_callback: Optional[Callable[[int], None]] = None) -> bool:
         """Downloads log file from sensor, verifying high-speed chunk stream until end marker."""
         while not self.download_queue.empty():
@@ -391,6 +407,7 @@ class MovesenseSensorClient:
             os.makedirs(dirname, exist_ok=True)
 
         downloaded = bytearray()
+        stream_ended_cleanly = False
 
         if self.uses_gsp:
             cmd = bytearray([3, 106]) + struct.pack("<I", log_id)
@@ -407,8 +424,11 @@ class MovesenseSensorClient:
                 print("⚠️ No ACK for FETCH_LOG, waiting for data stream...")
 
             chunks_received = 0
-            stream_ended_cleanly = False
             while True:
+                if not self.client or not self.client.is_connected:
+                    print(f"⚠️ BLE connection lost during download of log ID {log_id}")
+                    break
+
                 try:
                     packet = await asyncio.wait_for(self.download_queue.get(), timeout=timeout)
                     if len(packet) >= 6:
@@ -429,13 +449,13 @@ class MovesenseSensorClient:
                             break
                 except asyncio.TimeoutError:
                     if chunks_received > 0:
-                        print(f"⚠️ Stream pause/complete after {chunks_received} packets ({len(downloaded)} bytes).")
+                        print(f"⚠️ Stream pause/timeout after {chunks_received} packets ({len(downloaded)} bytes).")
                     break
 
             # If stream ended by timeout rather than EOF marker, give the BLE GATT layer
             # a moment to settle before subsequent commands (avoids GATT Unlikely Error 0x0E)
             if not stream_ended_cleanly and chunks_received > 0:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 # Drain any late-arriving packets
                 while not self.download_queue.empty():
                     self.download_queue.get_nowait()
@@ -453,6 +473,7 @@ class MovesenseSensorClient:
                     offset = struct.unpack("<I", chunk[0:4])[0]
                     data_bytes = chunk[4:]
                     if len(data_bytes) == 0:
+                        stream_ended_cleanly = True
                         break
                     if len(downloaded) < offset + len(data_bytes):
                         downloaded.extend(b"\0" * (offset + len(data_bytes) - len(downloaded)))
@@ -460,9 +481,17 @@ class MovesenseSensorClient:
                 except asyncio.TimeoutError:
                     break
 
+        # Save downloaded bytes (even partial for debugging/recovery)
         if downloaded:
             with open(target_filepath, 'wb') as f:
                 f.write(downloaded)
+
+        # Integrity check: download is only verified if clean EOF marker was seen
+        # OR if exact expected size is met and no holes remain
+        is_complete = stream_ended_cleanly or (expected_size > 0 and len(downloaded) >= expected_size)
+        if not is_complete:
+            print(f"⚠️ Download incomplete: received {len(downloaded)} bytes (expected: {expected_size if expected_size > 0 else 'clean EOF marker'}).")
+            return False
 
         return os.path.exists(target_filepath) and os.path.getsize(target_filepath) > 0
 
@@ -518,9 +547,15 @@ class MovesenseSensorClient:
 # ==============================================================================
 
 async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str, hr_csv_path: str,
-                             ecg_enabled: bool = True, drift_rate: float = 1.0) -> Dict[str, int]:
+                             ecg_enabled: bool = True, drift_rate: float = 1.0,
+                             start_anchor: Optional[Dict] = None,
+                             fallback_start_time: Optional[float] = None) -> Dict[str, int]:
     """Parses raw Movesense SBEM file and exports calibrated ECG (optional) and HR/RR to CSV
     using ISO-8601 timestamps with timezone offsets and linear drift compensation.
+    
+    If the SBEM file lacks a TimeDetailed chunk (chunk 107), falls back to the start_anchor
+    captured during pre-flight synchronization, or fallback_start_time (session start),
+    avoiding any timing discrepancy from post-session download times.
     """
     base_rel_ms = None
     base_utc_us = None
@@ -548,12 +583,29 @@ async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str
     except Exception as e:
         print(f"⚠️ Error reading SBEM chunks from {sbem_filepath}: {e}")
 
-    start_dt_utc = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc) if base_utc_us else datetime.now(timezone.utc)
+    # Determine baseline time anchor
+    if base_utc_us is not None:
+        start_dt_utc = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc)
+    elif start_anchor and start_anchor.get("utc_us"):
+        start_dt_utc = datetime.fromtimestamp(start_anchor["utc_us"] / 1_000_000, tz=timezone.utc)
+        print(f"ℹ️ [{user_id}] Using pre-flight synchronization anchor: {start_dt_utc.isoformat()}")
+    elif fallback_start_time is not None:
+        start_dt_utc = datetime.fromtimestamp(fallback_start_time, tz=timezone.utc)
+        print(f"ℹ️ [{user_id}] Using session start time anchor: {start_dt_utc.isoformat()}")
+    else:
+        start_dt_utc = datetime.now(timezone.utc)
+        print(f"⚠️ [{user_id}] Warning: No start anchor available; falling back to current time.")
+
     # Convert to host local timezone with explicit offset (e.g. +01:00)
     start_dt_local = start_dt_utc.astimezone()
 
-    # Use relative time anchor from chunk 107 or first sample
-    base_ms = base_rel_ms if base_rel_ms is not None else (ecg_samples[0][0] if ecg_samples else 0)
+    # Use relative time anchor from chunk 107, start_anchor, or first sample
+    if base_rel_ms is not None:
+        base_ms = base_rel_ms
+    elif start_anchor and "rel_ms" in start_anchor:
+        base_ms = start_anchor["rel_ms"]
+    else:
+        base_ms = ecg_samples[0][0] if ecg_samples else 0
 
     # 1. Write ECG CSV (only if ECG data was recorded)
     if ecg_enabled and ecg_samples:
@@ -1016,36 +1068,55 @@ class MovesenseApp(QMainWindow):
                 await client.stop_logging()
                 await asyncio.sleep(0.4)
 
-                # 3. Get latest log ID
-                log_id = await client.get_latest_log_id()
-                self.log(f"📋 Target Log ID: {log_id}")
+                # 3. Get latest log ID and expected size
+                log_id, expected_size = await client.get_latest_log_id()
+                size_str = f" (expected size: {expected_size} bytes)" if expected_size > 0 else ""
+                self.log(f"📋 Target Log ID: {log_id}{size_str}")
 
-                # 4. Download raw SBEM log file
+                # 4. Download raw SBEM log file with automatic retry
                 target_sbem = f"{self.session_id}_{sanitize_filename_part(user_id)}.sbem"
                 target_ecg_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_ecg.csv"
                 target_hr_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_hr_rr.csv"
 
-                self.log(f"📥 Downloading Log ID {log_id} to {target_sbem}...")
-                self.event_status_label.setText(f"📥 Downloading Log ID {log_id} from {user_id}...")
-                
                 def on_progress(bytes_dl):
                     self.event_status_label.setText(f"📥 Downloading {user_id}: {bytes_dl / 1024:.1f} KB received...")
 
-                success = await client.download_log_data(log_id, target_sbem, progress_callback=on_progress)
-                # Disconnect download connection cleanly before parsing & memory erase
-                await client.disconnect()
-                await asyncio.sleep(0.4)
+                download_success = False
+                for dl_attempt in range(1, 4):
+                    attempt_str = f" (attempt {dl_attempt}/3)" if dl_attempt > 1 else ""
+                    self.log(f"📥 Downloading Log ID {log_id} to {target_sbem}{attempt_str}...")
+                    self.event_status_label.setText(f"📥 Downloading Log ID {log_id} from {user_id}{attempt_str}...")
+
+                    download_success = await client.download_log_data(
+                        log_id, target_sbem, expected_size=expected_size, progress_callback=on_progress
+                    )
+                    if download_success:
+                        break
+
+                    if dl_attempt < 3:
+                        self.log(f"⚠️ Incomplete download for {user_id}. Re-establishing clean connection for retry...")
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0)
+                        try:
+                            await client.connect()
+                        except Exception as e_rec:
+                            self.log(f"⚠️ Reconnect error: {e_rec}")
 
                 # 5. Integrity Verification & CSV Export
-                file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and success) else 0
+                file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and download_success) else 0
 
-                if file_size > 0:
-                    self.log(f"✅ Verified log download: {target_sbem} ({file_size} bytes).")
+                if file_size > 0 and download_success:
+                    self.log(f"✅ Verified complete log download: {target_sbem} ({file_size} bytes).")
                     self.event_status_label.setText(f"Parsing & exporting CSV for {user_id}...")
                     counts = await export_sbem_to_csv(
                         target_sbem, user_id, target_ecg_csv, target_hr_csv,
                         ecg_enabled=self.ecg_enabled,
-                        drift_rate=drift_rate
+                        drift_rate=drift_rate,
+                        start_anchor=start_anchor,
+                        fallback_start_time=self.session_start_time
                     )
                     if self.ecg_enabled:
                         self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
@@ -1058,12 +1129,13 @@ class MovesenseApp(QMainWindow):
                             f"{target_sbem} ({file_size} bytes, {counts['rr_count']} RR intervals)"
                         )
 
-                    # 6. Safe Memory Erase (performed in a fresh, clean connection session)
+                    # 6. Safe Memory Erase (only executed after verified download)
                     self.log(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
-                    erase_client = MovesenseSensorClient(mac)
                     try:
-                        await erase_client.connect()
-                        erased = await erase_client.clear_logbook()
+                        if not client.client or not client.client.is_connected:
+                            await client.connect()
+                        await asyncio.sleep(0.5)
+                        erased = await client.clear_logbook()
                         if erased:
                             cleared_sensors.append(user_id)
                             self.log(f"✅ Sensor memory cleared successfully for {user_id}.")
@@ -1072,9 +1144,10 @@ class MovesenseApp(QMainWindow):
                     except Exception as e_erase:
                         self.log(f"⚠️ Memory erase warning for {user_id}: {e_erase}")
                     finally:
-                        await erase_client.disconnect()
+                        await client.disconnect()
                 else:
-                    self.log(f"⚠️ Download incomplete or empty for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
+                    self.log(f"⚠️ Download incomplete or unverified for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
+                    await client.disconnect()
 
             except Exception as e:
                 err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
