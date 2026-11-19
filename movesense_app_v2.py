@@ -1,28 +1,661 @@
 import sys
+import os
 import csv
+import re
+import zlib
+import struct
 import asyncio
-from datetime import datetime
+import subprocess
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List, Any, Callable, Tuple
 from bleak import BleakClient, BleakScanner
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QListWidget, QMessageBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView)
+                             QTableWidgetItem, QHeaderView, QPlainTextEdit,
+                             QRadioButton, QButtonGroup, QGroupBox)
 from qasync import QEventLoop, asyncSlot
+from sbem_tools.parse_sbem import read_chunks
 
-HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
+# Suppress harmless Wayland focus warnings on Linux desktop
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
+
+
+def ensure_bluetooth_powered(cycle: bool = False):
+    """Ensures host Bluetooth controller is powered on via bluetoothctl."""
+    try:
+        if cycle:
+            subprocess.run(["bluetoothctl", "power", "off"], capture_output=True, timeout=1.5)
+            subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=1.5)
+        else:
+            subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=1.5)
+    except Exception:
+        pass
+
+# ==============================================================================
+# Movesense BLE UUIDs & Protocol Constants
+# ==============================================================================
+
+# GSP Service (Generic SensorData Protocol - default Movesense DataLogger firmware)
+GSP_SERVICE_UUID = "34802252-7185-4d5d-b431-630e7050e8f0"
+GSP_WRITE_CHAR_UUID = "34800001-7185-4d5d-b431-630e7050e8f0"
+GSP_NOTIFY_CHAR_UUID = "34800002-7185-4d5d-b431-630e7050e8f0"
+
+# Whiteboard GATT Service (Movesense Protocol V9)
+WB_SERVICE_UUID = "0000fdf3-0000-1000-8000-00805f9b34fb"
+WB_WRITE_CHAR_UUID = "6b200001-ff4e-4979-8186-fb7ba486fcd7"
+WB_NOTIFY_CHAR_UUID = "6b200002-ff4e-4979-8186-fb7ba486fcd7"
+
+# Movesense 16-bit ADC to mV conversion scale
+ECG_LSB_TO_MV = 0.000381469726563
+
+# Whiteboard Framing & Message Constants
+WB_MSG_HELLO = 0x12
+WB_MSG_HELLO_ACK = 0x13
+WB_MSG_CLIENT_ON_NOTIFY = 0x14
+WB_MSG_RESOURCE_GET_REQUEST = 0x0A
+WB_MSG_PROVIDER_GET_REQUEST = 0x0D
+WB_MSG_PROVIDER_PUT_REQUEST = 0x0E
+WB_MSG_PROVIDER_DELETE_REQUEST = 0x17
+
+RES_ID_DATALOGGER_CONFIG = bytes([0xF0, 0x33, 0x00])
+RES_ID_DATALOGGER_STATE  = bytes([0xF0, 0x33, 0x01])
+RES_ID_LOGBOOK_ENTRIES   = bytes([0xF0, 0x34, 0x00])
+
+
+def sanitize_filename_part(text: str) -> str:
+    """Replaces characters unsafe in filenames with underscores."""
+    return re.sub(r'[^A-Za-z0-9._-]', '_', text).strip('._') or "unnamed"
+
+
+def sf_encode(payload: bytes) -> bytes:
+    """Encodes payload with HDLC framing (0x7E) and CRC32 IEEE LE."""
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    crc_bytes = struct.pack("<I", crc)
+    data = payload + crc_bytes
+    framed = bytearray([0x7E])
+    for b in data:
+        if b in (0x7E, 0x7D):
+            framed.append(0x7D)
+            framed.append(b ^ 0x20)
+        else:
+            framed.append(b)
+    framed.append(0x7E)
+    return bytes(framed)
+
+
+def sf_decode(frame: bytes) -> bytes:
+    """Decodes HDLC framed packet and validates CRC32 IEEE."""
+    if len(frame) < 6 or frame[0] != 0x7E or frame[-1] != 0x7E:
+        return b""
+    unescaped = bytearray()
+    i = 1
+    end = len(frame) - 1
+    while i < end:
+        b = frame[i]
+        if b == 0x7D:
+            i += 1
+            if i < end:
+                unescaped.append(frame[i] ^ 0x20)
+        else:
+            unescaped.append(b)
+        i += 1
+    if len(unescaped) < 4:
+        return b""
+    payload = bytes(unescaped[:-4])
+    recvd_crc = struct.unpack("<I", unescaped[-4:])[0]
+    calc_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    return payload if recvd_crc == calc_crc else b""
+
+
+def pack_serial(serial_str: str) -> bytes:
+    res = bytearray(12)
+    for group in range(4):
+        chars = [0, 0, 0, 0]
+        for i in range(4):
+            idx = group * 4 + i
+            if idx < len(serial_str):
+                chars[i] = (ord(serial_str[idx]) - 0x2F) & 0x3F
+        res[group * 3]     = chars[0] | ((chars[1] & 0x03) << 6)
+        res[group * 3 + 1] = (chars[1] >> 2) | ((chars[2] & 0x0F) << 4)
+        res[group * 3 + 2] = (chars[2] >> 4) | (chars[3] << 2)
+    return bytes(res)
+
+
+def unpack_serial(b: bytes) -> str:
+    chars = []
+    for group in range(4):
+        b0 = b[group * 3]
+        b1 = b[group * 3 + 1]
+        b2 = b[group * 3 + 2]
+        c0 = (b0 & 0x3F) + 0x2F
+        c1 = (((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)) + 0x2F
+        c2 = (((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)) + 0x2F
+        c3 = ((b2 >> 2) & 0x3F) + 0x2F
+        chars.extend([chr(c0), chr(c1), chr(c2), chr(c3)])
+    return "".join(chars)
+
+
+# ==============================================================================
+# Unified Movesense DataLogger & Whiteboard Client
+# ==============================================================================
+
+class MovesenseSensorClient:
+    """Manages connection, Whiteboard DataLogger recording, and Logbook operations over BLE."""
+
+    def __init__(self, mac: str):
+        self.mac = mac
+        self.client: Optional[BleakClient] = None
+        self.serial_number = ""
+        self.uses_gsp = True
+        self.download_queue: asyncio.Queue = asyncio.Queue()
+        self.response_queue: asyncio.Queue = asyncio.Queue()
+        self.download_done = asyncio.Event()
+
+    def _on_notification(self, sender: Any, data: bytearray):
+        raw = bytes(data)
+        if self.uses_gsp:
+            if not raw:
+                return
+            resp_code = raw[0]
+            if resp_code in (2, 3):  # GSP DATA or DATA_PART2
+                self.download_queue.put_nowait(raw)
+            else:
+                self.response_queue.put_nowait(raw)
+        else:
+            # Whiteboard V9 frame
+            payload = sf_decode(raw)
+            if not payload or len(payload) < 6 or payload[0] != 0xA5:
+                return
+            msg_type = payload[1]
+            if msg_type == WB_MSG_CLIENT_ON_NOTIFY:
+                self.download_queue.put_nowait(payload[6:])
+            else:
+                self.response_queue.put_nowait(payload)
+
+    async def connect(self, timeout: float = 12.0) -> bool:
+        """Connects to sensor, auto-detects GSP vs Whiteboard V9, and performs handshake."""
+        last_err = None
+        for attempt in range(2):
+            try:
+                self.client = BleakClient(self.mac, timeout=timeout)
+                await self.client.connect()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    await asyncio.sleep(2.0)
+
+        if last_err is not None:
+            raise last_err
+
+        # Check for GSP service
+        service_uuids = [s.uuid.lower() for s in self.client.services]
+        if GSP_SERVICE_UUID.lower() in service_uuids:
+            self.uses_gsp = True
+            await self.client.start_notify(GSP_NOTIFY_CHAR_UUID, self._on_notification)
+            await asyncio.sleep(0.3)
+            # Send GSP HELLO
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([0, 100]), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(resp) >= 4 and resp[0] == 1:
+                    parts = resp[3:].decode('ascii', errors='ignore').split('\x00')
+                    if parts:
+                        self.serial_number = parts[0]
+            except asyncio.TimeoutError:
+                pass
+        else:
+            self.uses_gsp = False
+            await self.client.start_notify(WB_NOTIFY_CHAR_UUID, self._on_notification)
+            await asyncio.sleep(0.3)
+            # Send Whiteboard HELLO
+            hello_payload = bytearray(38)
+            hello_payload[0] = 0x09; hello_payload[1] = 0x09
+            hello_payload[3:15] = pack_serial("199999999999")
+            hello_payload[15:19] = bytes([0x04, 0x01, 0x02, 0x00])
+            packet = bytes([0xA5, WB_MSG_HELLO, 0x26, 0x00, 0x00, 0x00]) + bytes(hello_payload)
+            await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(packet), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                body = resp[6:]
+                if len(body) >= 15:
+                    self.serial_number = unpack_serial(body[3:15])
+            except asyncio.TimeoutError:
+                pass
+
+        return True
+
+    async def disconnect(self):
+        """Disconnects cleanly from the sensor."""
+        if self.client and self.client.is_connected:
+            try:
+                char_uuid = GSP_NOTIFY_CHAR_UUID if self.uses_gsp else WB_NOTIFY_CHAR_UUID
+                await self.client.stop_notify(char_uuid)
+            except Exception:
+                pass
+            await self.client.disconnect()
+        self.client = None
+
+    async def sync_utc_time(self) -> Tuple[bool, float]:
+        """Sets UTC time on sensor, measuring and compensating for BLE round-trip latency."""
+        if self.uses_gsp:
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            t0 = time.time()
+            utc_us = int(t0 * 1_000_000)
+            time_bytes = struct.pack("<Q", utc_us)
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([8, 101]) + time_bytes, response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=4.0)
+                t1 = time.time()
+                rtt_ms = (t1 - t0) * 1000.0
+                status = struct.unpack("<H", resp[2:4])[0] if len(resp) >= 4 else 0
+                return (status in (200, 204), rtt_ms)
+            except asyncio.TimeoutError:
+                return (False, 0.0)
+        return (True, 0.0)
+
+    async def get_time_detailed(self) -> Optional[Dict[str, Any]]:
+        """Queries /Time/Detailed to obtain paired UTC time, relative ticks, and tick rate."""
+        if self.uses_gsp:
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            t_host = time.time()
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([4, 110]) + b"/Time/Detailed\x00", response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=4.0)
+                if len(resp) >= 4:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    if status == 200 and len(resp) >= 20:
+                        utc_us, rel_ms, tick_rate = struct.unpack("<QII", resp[4:20])
+                        return {
+                            "utc_us": utc_us,
+                            "rel_ms": rel_ms,
+                            "tick_rate": tick_rate,
+                            "host_time": t_host,
+                        }
+            except asyncio.TimeoutError:
+                pass
+        return None
+
+    async def configure_and_start_logging(self, ecg_enabled: bool = True) -> bool:
+        """Configures DataLogger (ECG optional + HR + Time) and starts logging."""
+        if self.uses_gsp:
+            # 1. Configure DataLogger: (ECG 125Hz optional) + /Meas/HR + /Time/Detailed
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            config_data = bytearray([6, 102])
+            if ecg_enabled:
+                config_data.extend("/Meas/ECG/125/mV".encode() + b"\0")
+            config_data.extend("/Meas/HR".encode() + b"\0")
+            config_data.extend("/Time/Detailed".encode() + b"\0")
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, config_data, response=True)
+            try:
+                await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            await asyncio.sleep(0.2)
+
+            # 2. Start DataLogger (State 3 = DATALOGGER_LOGGING)
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([9, 103, 3]), response=True)
+            started = False
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(resp) >= 4:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    started = status in (200, 202)
+            except asyncio.TimeoutError:
+                return False
+
+            if started:
+                # Trigger a time sync now that DataLogger is actively LOGGING
+                # so the sensor firmware immediately writes chunk 107 (TimeDetailed) into flash
+                await asyncio.sleep(0.1)
+                await self.sync_utc_time()
+
+            return started
+        else:
+            # Whiteboard V9 implementation
+            payload = RES_ID_DATALOGGER_STATE + bytes([0x01, 0x00, 0x00, 0x01, 0x03, 0x00, 0x03])
+            header = bytes([0xA5, WB_MSG_PROVIDER_PUT_REQUEST, len(payload), 0x00, 0x04, 0x00])
+            await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(header + payload), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                body = resp[6:]
+                if len(body) >= 8:
+                    status = struct.unpack("<H", body[6:8])[0]
+                    return status in (200, 202)
+            except asyncio.TimeoutError:
+                return False
+
+        return False
+
+    async def stop_logging(self) -> bool:
+        """Stops DataLogger (sets state 2 = DATALOGGER_READY)."""
+        if self.uses_gsp:
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([9, 104, 2]), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(resp) >= 4:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    return status in (200, 202)
+            except asyncio.TimeoutError:
+                return False
+        else:
+            payload = RES_ID_DATALOGGER_STATE + bytes([0x01, 0x00, 0x00, 0x01, 0x03, 0x00, 0x02])
+            header = bytes([0xA5, WB_MSG_PROVIDER_PUT_REQUEST, len(payload), 0x00, 0x05, 0x00])
+            await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(header + payload), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                body = resp[6:]
+                if len(body) >= 8:
+                    status = struct.unpack("<H", body[6:8])[0]
+                    return status in (200, 202)
+            except asyncio.TimeoutError:
+                return False
+
+        return False
+
+    async def get_latest_log_id(self) -> Tuple[int, int]:
+        """Queries /Mem/Logbook/entries to determine the latest recorded log ID and expected size."""
+        if self.uses_gsp:
+            while not self.response_queue.empty():
+                self.response_queue.get_nowait()
+            cmd = bytearray([4, 105]) + b"/Mem/Logbook/entries\x00"
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, cmd, response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(resp) >= 5 and resp[0] == 1:
+                    status = struct.unpack("<H", resp[2:4])[0]
+                    if status == 200:
+                        count = resp[4]
+                        entry_data = resp[5:]
+                        entries = []
+                        for i in range(0, len(entry_data), 16):
+                            chunk = entry_data[i:i+16]
+                            if len(chunk) == 16:
+                                eid = struct.unpack("<I", chunk[0:4])[0]
+                                size = struct.unpack("<I", chunk[8:12])[0]
+                                entries.append((eid, size))
+                        if entries:
+                            latest_id, expected_size = max(entries, key=lambda x: x[0])
+                            print(f"📋 Found {count} log entries on sensor: IDs {[e[0] for e in entries]}, selecting latest ID {latest_id} (expected size: {expected_size} bytes)")
+                            return latest_id, expected_size
+            except asyncio.TimeoutError:
+                print("⚠️ Timeout querying /Mem/Logbook/entries")
+        return 1, 0
+
+    async def download_log_data(self, log_id: int, target_filepath: str, expected_size: int = 0,
+                                timeout: float = 8.0, 
+                                progress_callback: Optional[Callable[[int], None]] = None) -> bool:
+        """Downloads log file from sensor, verifying high-speed chunk stream until end marker."""
+        while not self.download_queue.empty():
+            self.download_queue.get_nowait()
+        while not self.response_queue.empty():
+            self.response_queue.get_nowait()
+        self.download_done.clear()
+
+        dirname = os.path.dirname(target_filepath)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+
+        downloaded = bytearray()
+        stream_ended_cleanly = False
+
+        if self.uses_gsp:
+            cmd = bytearray([3, 106]) + struct.pack("<I", log_id)
+            await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, cmd, response=True)
+            # Check FETCH_LOG command acknowledgement
+            try:
+                init_resp = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
+                if len(init_resp) >= 4 and init_resp[0] == 1:
+                    status = struct.unpack("<H", init_resp[2:4])[0]
+                    if status != 200:
+                        print(f"❌ FETCH_LOG returned error status {status} for log ID {log_id}")
+                        return False
+            except asyncio.TimeoutError:
+                print("⚠️ No ACK for FETCH_LOG, waiting for data stream...")
+
+            chunks_received = 0
+            while True:
+                if not self.client or not self.client.is_connected:
+                    print(f"⚠️ BLE connection lost during download of log ID {log_id}")
+                    break
+
+                try:
+                    packet = await asyncio.wait_for(self.download_queue.get(), timeout=timeout)
+                    if len(packet) >= 6:
+                        offset = struct.unpack("<I", packet[2:6])[0]
+                        chunk = packet[6:]
+                        if len(chunk) > 0:
+                            chunks_received += 1
+                            if len(downloaded) < offset + len(chunk):
+                                downloaded.extend(b"\0" * (offset + len(chunk) - len(downloaded)))
+                            downloaded[offset:offset + len(chunk)] = chunk
+                            if progress_callback and chunks_received % 25 == 0:
+                                progress_callback(len(downloaded))
+                        else:
+                            print(f"🏁 End-of-file marker received ({chunks_received} packets, {len(downloaded)} bytes).")
+                            if progress_callback:
+                                progress_callback(len(downloaded))
+                            stream_ended_cleanly = True
+                            break
+                except asyncio.TimeoutError:
+                    if chunks_received > 0:
+                        print(f"⚠️ Stream pause/timeout after {chunks_received} packets ({len(downloaded)} bytes).")
+                    break
+
+            # If stream ended by timeout rather than EOF marker, give the BLE GATT layer
+            # a moment to settle before subsequent commands (avoids GATT Unlikely Error 0x0E)
+            if not stream_ended_cleanly and chunks_received > 0:
+                await asyncio.sleep(1.0)
+                # Drain any late-arriving packets
+                while not self.download_queue.empty():
+                    self.download_queue.get_nowait()
+        else:
+            # Whiteboard V9 download
+            res_id = bytes([0x00, 0x34, 0x05])
+            payload = res_id + bytes([0x01, 0x00, 0x00, 0x00])
+            header = bytes([0xA5, WB_MSG_PROVIDER_GET_REQUEST, len(payload), 0x00, 0x06, 0x00])
+            await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(header + payload), response=True)
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(self.download_queue.get(), timeout=timeout)
+                    if not chunk or len(chunk) < 4:
+                        break
+                    offset = struct.unpack("<I", chunk[0:4])[0]
+                    data_bytes = chunk[4:]
+                    if len(data_bytes) == 0:
+                        stream_ended_cleanly = True
+                        break
+                    if len(downloaded) < offset + len(data_bytes):
+                        downloaded.extend(b"\0" * (offset + len(data_bytes) - len(downloaded)))
+                    downloaded[offset:offset + len(data_bytes)] = data_bytes
+                except asyncio.TimeoutError:
+                    break
+
+        # Save downloaded bytes (even partial for debugging/recovery)
+        if downloaded:
+            with open(target_filepath, 'wb') as f:
+                f.write(downloaded)
+
+        # Integrity check: download is only verified if clean EOF marker was seen
+        # OR if exact expected size is met and no holes remain
+        is_complete = stream_ended_cleanly or (expected_size > 0 and len(downloaded) >= expected_size)
+        if not is_complete:
+            print(f"⚠️ Download incomplete: received {len(downloaded)} bytes (expected: {expected_size if expected_size > 0 else 'clean EOF marker'}).")
+            return False
+
+        return os.path.exists(target_filepath) and os.path.getsize(target_filepath) > 0
+
+    async def clear_logbook(self) -> bool:
+        """Erases all stored logs from the sensor internal memory (CLEAR_LOGBOOK).
+        
+        Ensures a clean connection and retries with reconnection if a GATT collision occurs.
+        """
+        if self.uses_gsp:
+            for attempt in range(2):
+                try:
+                    if self.client is None or not self.client.is_connected:
+                        await self.connect()
+
+                    while not self.response_queue.empty():
+                        self.response_queue.get_nowait()
+                    await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([5, 107]), response=True)
+                    resp = await asyncio.wait_for(self.response_queue.get(), timeout=8.0)
+                    if len(resp) >= 4:
+                        status = struct.unpack("<H", resp[2:4])[0]
+                        return status in (200, 204)
+                except asyncio.TimeoutError:
+                    return False
+                except Exception as e:
+                    if attempt == 0:
+                        print(f"⚠️ Clear attempt {attempt+1} failed ({type(e).__name__}), reconnecting after 2s...")
+                        try:
+                            await self.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0)
+                    else:
+                        print(f"❌ Clear failed after retry: {type(e).__name__}: {e}")
+                        return False
+        else:
+            payload = RES_ID_LOGBOOK_ENTRIES + bytes([0x01, 0x00, 0x00, 0x00])
+            header = bytes([0xA5, WB_MSG_PROVIDER_DELETE_REQUEST, len(payload), 0x00, 0x07, 0x00])
+            await self.client.write_gatt_char(WB_WRITE_CHAR_UUID, sf_encode(header + payload), response=True)
+            try:
+                resp = await asyncio.wait_for(self.response_queue.get(), timeout=6.0)
+                body = resp[6:]
+                if len(body) >= 8:
+                    status = struct.unpack("<H", body[6:8])[0]
+                    return status in (200, 204)
+            except asyncio.TimeoutError:
+                return False
+
+        return False
+
+
+# ==============================================================================
+# SBEM Log Parser & CSV Exporter
+# ==============================================================================
+
+async def export_sbem_to_csv(sbem_filepath: str, user_id: str, ecg_csv_path: str, hr_csv_path: str,
+                             ecg_enabled: bool = True, drift_rate: float = 1.0,
+                             start_anchor: Optional[Dict] = None,
+                             fallback_start_time: Optional[float] = None) -> Dict[str, int]:
+    """Parses raw Movesense SBEM file and exports calibrated ECG (optional) and HR/RR to CSV
+    using ISO-8601 timestamps with timezone offsets and linear drift compensation.
+    
+    If the SBEM file lacks a TimeDetailed chunk (chunk 107), falls back to the start_anchor
+    captured during pre-flight synchronization, or fallback_start_time (session start),
+    avoiding any timing discrepancy from post-session download times.
+    """
+    base_rel_ms = None
+    base_utc_us = None
+    ecg_samples = []
+    hr_samples = []
+
+    def data_cb(cid, b):
+        nonlocal base_rel_ms, base_utc_us
+        if cid == 107 and len(b) >= 12:  # TimeDetailed
+            base_rel_ms = struct.unpack("<I", b[:4])[0]
+            base_utc_us = struct.unpack("<Q", b[4:12])[0]
+        elif cid == 68 and len(b) >= 4:   # ECG 125Hz chunk
+            ts_ms = struct.unpack("<I", b[:4])[0]
+            raw_vals = struct.unpack(f"<{(len(b) - 4) // 2}h", b[4:])
+            for i, val in enumerate(raw_vals):
+                t_sample = ts_ms + int(i * 1000 / 125)
+                ecg_samples.append((t_sample, val * ECG_LSB_TO_MV))
+        elif cid == 74 and len(b) >= 6:   # HR / RR interval chunk
+            avg_hr = struct.unpack("<f", b[:4])[0]
+            rrs = list(struct.unpack(f"<{(len(b) - 4) // 2}H", b[4:]))
+            hr_samples.append((avg_hr, rrs))
+
+    try:
+        await read_chunks(sbem_filepath, data_callback=data_cb)
+    except Exception as e:
+        print(f"⚠️ Error reading SBEM chunks from {sbem_filepath}: {e}")
+
+    # Determine baseline time anchor
+    if base_utc_us is not None:
+        start_dt_utc = datetime.fromtimestamp(base_utc_us / 1_000_000, tz=timezone.utc)
+    elif start_anchor and start_anchor.get("utc_us"):
+        start_dt_utc = datetime.fromtimestamp(start_anchor["utc_us"] / 1_000_000, tz=timezone.utc)
+        print(f"ℹ️ [{user_id}] Using pre-flight synchronization anchor: {start_dt_utc.isoformat()}")
+    elif fallback_start_time is not None:
+        start_dt_utc = datetime.fromtimestamp(fallback_start_time, tz=timezone.utc)
+        print(f"ℹ️ [{user_id}] Using session start time anchor: {start_dt_utc.isoformat()}")
+    else:
+        start_dt_utc = datetime.now(timezone.utc)
+        print(f"⚠️ [{user_id}] Warning: No start anchor available; falling back to current time.")
+
+    # Convert to host local timezone with explicit offset (e.g. +01:00)
+    start_dt_local = start_dt_utc.astimezone()
+
+    # Use relative time anchor from chunk 107, start_anchor, or first sample
+    if base_rel_ms is not None:
+        base_ms = base_rel_ms
+    elif start_anchor and "rel_ms" in start_anchor:
+        base_ms = start_anchor["rel_ms"]
+    else:
+        base_ms = ecg_samples[0][0] if ecg_samples else 0
+
+    # 1. Write ECG CSV (only if ECG data was recorded)
+    if ecg_enabled and ecg_samples:
+        with open(ecg_csv_path, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "UserID", "SampleIndex", "ECG_mV", "Elapsed_Seconds"])
+            for idx, (t_ms, mv) in enumerate(ecg_samples):
+                elapsed_ms = (t_ms - base_ms) * drift_rate
+                dt = start_dt_local + timedelta(milliseconds=elapsed_ms)
+                iso_ts = dt.isoformat(timespec='milliseconds')
+                elapsed_s = f"{elapsed_ms / 1000.0:.3f}"
+                writer.writerow([iso_ts, user_id, idx, f"{mv:.4f}", elapsed_s])
+
+    # 2. Write HR / RR CSV
+    rr_count = 0
+    t_rr_ms = base_ms
+    with open(hr_csv_path, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "UserID", "HeartRate_bpm", "RR_Interval_ms", "Elapsed_Seconds"])
+        for hr, rrs in hr_samples:
+            for rr in rrs:
+                t_rr_ms += rr
+                elapsed_ms = (t_rr_ms - base_ms) * drift_rate
+                dt = start_dt_local + timedelta(milliseconds=elapsed_ms)
+                iso_ts = dt.isoformat(timespec='milliseconds')
+                elapsed_s = f"{elapsed_ms / 1000.0:.3f}"
+                writer.writerow([iso_ts, user_id, f"{hr:.1f}", rr, elapsed_s])
+                rr_count += 1
+
+    return {'ecg_count': len(ecg_samples), 'rr_count': rr_count}
+
+
+# ==============================================================================
+# Main GUI Application
+# ==============================================================================
 
 class MovesenseApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Movesense ECG & RR Recorder")
-        self.resize(600, 720)
+        self.setWindowTitle("Movesense Whiteboard DataLogger & Logbook Acquisition")
+        self.resize(650, 750)
 
         # Application State
         self.sensors_to_connect = [] 
-        self.active_clients = []     
         self.is_recording = False
         self.session_id = ""
+        self.session_start_time = None
+        self.sensor_time_anchors = {}
         self.event_counter = 1
+        self.ecg_enabled = False  # Default: HR/RR only (faster, smaller files)
 
         self.init_ui()
 
@@ -76,13 +709,37 @@ class MovesenseApp(QMainWindow):
         ready_btn_layout.addWidget(self.remove_all_btn)
         main_layout.addLayout(ready_btn_layout)
 
+        # --- Recording Mode Selector ---
+        mode_group = QGroupBox("Recording Mode")
+        mode_layout = QHBoxLayout(mode_group)
+        self.mode_btn_group = QButtonGroup(self)
+        self.radio_hr_only = QRadioButton("💓 HR / RR only  (small file, fast download)")
+        self.radio_hr_only.setChecked(True)
+        self.radio_full = QRadioButton("📈 ECG + HR / RR  (full waveform, large file)")
+        self.radio_hr_only.setToolTip(
+            "Records only heart rate and RR intervals.\n"
+            "~97% smaller file than full ECG mode.\n"
+            "Recommended for HRV analysis."
+        )
+        self.radio_full.setToolTip(
+            "Records the raw ECG waveform at 125 Hz plus HR/RR.\n"
+            "Produces a ~170 KB SBEM file per 10 minutes.\n"
+            "Use when you need the raw ECG signal."
+        )
+        self.mode_btn_group.addButton(self.radio_hr_only, 0)
+        self.mode_btn_group.addButton(self.radio_full, 1)
+        self.radio_hr_only.toggled.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.radio_hr_only)
+        mode_layout.addWidget(self.radio_full)
+        main_layout.addWidget(mode_group)
+
         # --- Recording Controls ---
         rec_layout = QHBoxLayout()
-        self.start_btn = QPushButton("▶ START RECORDING")
+        self.start_btn = QPushButton("▶ START WHITEBOARD RECORDING")
         self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
-        self.start_btn.clicked.connect(self.start_recording) 
+        self.start_btn.clicked.connect(self.start_recording)
 
-        self.stop_btn = QPushButton("⏹ STOP RECORDING")
+        self.stop_btn = QPushButton("⏹ STOP & DOWNLOAD LOGS")
         self.stop_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; padding: 10px;")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_recording)
@@ -93,62 +750,88 @@ class MovesenseApp(QMainWindow):
 
         # --- Live Event Controls ---
         main_layout.addWidget(QLabel("--- Step 3: Live Event Marker ---"))
+        event_layout = QHBoxLayout()
+        self.event_name_input = QLineEdit()
+        self.event_name_input.setPlaceholderText("Event label (e.g., Baseline, Stress, Recovery)")
+        self.event_name_input.setEnabled(False)
+        self.event_name_input.returnPressed.connect(self.add_event)
+
         self.add_event_btn = QPushButton("📍 Add Event (Event1)")
         self.add_event_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px; font-size: 13px;")
         self.add_event_btn.setEnabled(False)
         self.add_event_btn.setShortcut("Ctrl+E")
-        self.add_event_btn.setToolTip("Click or press Ctrl+E to log an incremental event marker")
+        self.add_event_btn.setToolTip("Click, press Enter in label box, or press Ctrl+E to log an event marker")
         self.add_event_btn.clicked.connect(self.add_event)
-        main_layout.addWidget(self.add_event_btn)
 
-        self.event_status_label = QLabel("No events logged.")
+        event_layout.addWidget(self.event_name_input, 2)
+        event_layout.addWidget(self.add_event_btn, 1)
+        main_layout.addLayout(event_layout)
+
+        self.event_status_label = QLabel("Ready. Scan sensors and assign User IDs to begin.")
         self.event_status_label.setStyleSheet("color: #666; font-style: italic;")
         main_layout.addWidget(self.event_status_label)
 
+        # --- Activity Log Console ---
+        main_layout.addWidget(QLabel("--- Activity Log ---"))
+        self.log_console = QPlainTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumHeight(150)
+        self.log_console.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 11px;")
+        main_layout.addWidget(self.log_console)
+
+    def log(self, text: str):
+        """Prints to console and appends to GUI Activity Log."""
+        print(text)
+        self.log_console.appendPlainText(text)
+        sb = self.log_console.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def _on_mode_changed(self):
+        """Updates ecg_enabled state when recording mode radio changes."""
+        self.ecg_enabled = self.radio_full.isChecked()
+
     def remove_selected_sensor(self):
-        """Removes the selected sensor from Step 2."""
         selected_row = self.sensor_list_ui.currentRow()
         if 0 <= selected_row < len(self.sensors_to_connect):
             del self.sensors_to_connect[selected_row]
             self.sensor_list_ui.takeItem(selected_row)
 
     def remove_all_sensors(self):
-        """Removes all listed sensors from Step 2."""
         self.sensors_to_connect.clear()
         self.sensor_list_ui.clear()
 
     def add_event(self):
-        """Logs an event marker with the current timestamp and incremented Event#."""
+        """Logs an event marker with current ISO-8601 timestamp, label, and incremented Event#."""
         if not self.is_recording:
             return
 
-        event_name = f"Event{self.event_counter}"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        raw_label = self.event_name_input.text().strip()
+        event_id = f"Event{self.event_counter}"
+        event_label = raw_label if raw_label else event_id
 
-        session_filename = f"{self.session_id}.csv"
+        now_dt = datetime.now().astimezone()
+        timestamp = now_dt.isoformat(timespec='milliseconds')
+        elapsed_s = f"{(time.time() - self.session_start_time):.3f}" if self.session_start_time else "0.000"
         events_filename = f"{self.session_id}_events.csv"
 
         try:
-            # Append event row to main session CSV
-            with open(session_filename, mode='a', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([timestamp, "EVENT", "", "", event_name])
-
-            # Append to dedicated events CSV
             with open(events_filename, mode='a', newline='') as file:
                 writer = csv.writer(file)
-                writer.writerow([timestamp, event_name])
+                writer.writerow([timestamp, event_id, event_label, elapsed_s])
 
-            print(f"[{timestamp}] 📍 Logged {event_name}")
-            self.event_status_label.setText(f"✅ Last logged: {event_name} at {timestamp.split(' ')[1]}")
+            self.log(f"[{timestamp}] 📍 Logged {event_id} - Label: '{event_label}' (Elapsed: {elapsed_s}s)")
+            display_time = timestamp.split('T')[1] if 'T' in timestamp else timestamp
+            self.event_status_label.setText(f"✅ Last logged: {event_id} ('{event_label}') at {display_time}")
             self.event_counter += 1
             self.add_event_btn.setText(f"📍 Add Event (Event{self.event_counter})")
+            self.event_name_input.clear()
+            self.event_name_input.setFocus()
         except Exception as e:
-            print(f"❌ Failed to log event: {e}")
+            self.log(f"❌ Failed to log event: {e}")
             self.event_status_label.setText(f"❌ Error logging event: {e}")
 
     def get_next_default_user_id(self, existing_ids):
-        """Returns the next unique default User_N identifier."""
         counter = 1
         while f"User_{counter}".lower() in existing_ids:
             counter += 1
@@ -156,48 +839,39 @@ class MovesenseApp(QMainWindow):
 
     @asyncSlot()
     async def scan_sensors(self):
-        """Scans for BLE devices and populates the table with Movesense sensors."""
+        ensure_bluetooth_powered()
         self.scan_btn.setEnabled(False)
         self.scan_btn.setText("Scanning... Please wait 5 seconds...")
-        self.scanned_table.setRowCount(0) # Clear previous scan results
+        self.scanned_table.setRowCount(0)
 
         try:
             devices = await BleakScanner.discover(timeout=5.0)
-            
             existing_ids = {sensor['user'].lower() for sensor in self.sensors_to_connect}
             assigned_placeholders = set(existing_ids)
             row = 0
             for d in devices:
-                # Filter for Movesense devices
-                if d.name and "KANA" in d.name:
+                if d.name and ("KANA" in d.name or "Movesense" in d.name):
                     self.scanned_table.insertRow(row)
-                    
-                    # Add Name and MAC
                     self.scanned_table.setItem(row, 0, QTableWidgetItem(d.name))
                     self.scanned_table.setItem(row, 1, QTableWidgetItem(d.address))
                     
-                    # Add a Text Input for User ID with next available placeholder
                     default_user = self.get_next_default_user_id(assigned_placeholders)
                     assigned_placeholders.add(default_user.lower())
 
                     user_input = QLineEdit()
                     user_input.setPlaceholderText(default_user)
                     self.scanned_table.setCellWidget(row, 2, user_input)
-                    
                     row += 1
                     
             if row == 0:
                 QMessageBox.information(self, "Scan Complete", "No Movesense sensors found. Make sure they are awake!")
-                
         except Exception as e:
             QMessageBox.warning(self, "Scan Error", f"An error occurred while scanning: {e}")
-            
         finally:
             self.scan_btn.setEnabled(True)
             self.scan_btn.setText("🔍 Scan for Movesense Sensors")
 
     def add_all_scanned(self):
-        """Validates User IDs and MAC addresses, ensuring all User IDs are unique, then stages them."""
         existing_users_lower = {sensor['user'].lower(): sensor['user'] for sensor in self.sensors_to_connect}
         existing_macs = {sensor['mac'] for sensor in self.sensors_to_connect}
 
@@ -206,45 +880,27 @@ class MovesenseApp(QMainWindow):
 
         for row in range(self.scanned_table.rowCount()):
             mac = self.scanned_table.item(row, 1).text()
-            
-            # Extract text from the QLineEdit widget in the 3rd column
+            name = self.scanned_table.item(row, 0).text()
             user_widget = self.scanned_table.cellWidget(row, 2)
-            user_id = user_widget.text().strip()
-            
-            # Fallback to the placeholder (e.g., "User_1") if blank
-            if not user_id:
-                user_id = user_widget.placeholderText()
+            user_id = user_widget.text().strip() or user_widget.placeholderText()
 
-            # Skip if MAC is already added
             if mac in existing_macs:
                 continue
 
             user_id_lower = user_id.lower()
-
-            # Check if this User ID conflicts with an already added sensor
             if user_id_lower in existing_users_lower:
                 conflicting = existing_users_lower[user_id_lower]
-                QMessageBox.warning(
-                    self,
-                    "Duplicate User ID",
-                    f"User ID '{user_id}' is already assigned to a sensor in the ready list (as '{conflicting}').\n\n"
-                    "Each sensor must have a unique User ID."
-                )
+                QMessageBox.warning(self, "Duplicate User ID", 
+                    f"User ID '{user_id}' is already assigned to a sensor (as '{conflicting}').\n\nEach sensor must have a unique User ID.")
                 return
 
-            # Check if this User ID is duplicated within the table itself
             if user_id_lower in new_users_seen:
-                conflicting = new_users_seen[user_id_lower]
-                QMessageBox.warning(
-                    self,
-                    "Duplicate User ID",
-                    f"User ID '{user_id}' is entered multiple times in the table.\n\n"
-                    "Each sensor must have a unique User ID."
-                )
+                QMessageBox.warning(self, "Duplicate User ID",
+                    f"User ID '{user_id}' is entered multiple times in the table.\n\nEach sensor must have a unique User ID.")
                 return
 
             new_users_seen[user_id_lower] = user_id
-            new_entries.append({'mac': mac, 'user': user_id})
+            new_entries.append({'mac': mac, 'user': user_id, 'name': name})
 
         if not new_entries and self.scanned_table.rowCount() > 0:
             QMessageBox.information(self, "Already Added", "All scanned sensors are already in the ready list.")
@@ -252,75 +908,27 @@ class MovesenseApp(QMainWindow):
 
         for entry in new_entries:
             self.sensors_to_connect.append(entry)
-            self.sensor_list_ui.addItem(f"User: {entry['user']}  |  MAC: {entry['mac']}")
+            self.sensor_list_ui.addItem(f"User: {entry['user']}  |  MAC: {entry['mac']}  ({entry.get('name', '')})")
 
-        # Clear the table after successfully adding them
         self.scanned_table.setRowCount(0)
-
-    def create_hr_handler(self, user_id, session_filename):
-        def hr_data_handler(sender, data):
-            if not self.is_recording:
-                return
-
-            flags = data[0]
-            hr_format = flags & 0x01
-            rr_present = (flags & 0x10) >> 4
-
-            offset = 1
-            if hr_format == 0:
-                hr = data[offset]
-                offset += 1
-            else:
-                hr = int.from_bytes(data[offset:offset+2], byteorder='little')
-                offset += 2
-
-            if flags & 0x08:
-                offset += 2
-
-            if rr_present:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                
-                with open(session_filename, mode='a', newline='') as file:
-                    writer = csv.writer(file)
-                    while offset < len(data):
-                        rr_raw = int.from_bytes(data[offset:offset+2], byteorder='little')
-                        rr_ms = (rr_raw / 1024.0) * 1000.0
-                        
-                        writer.writerow([timestamp, user_id, hr, round(rr_ms, 1), ""])
-                        print(f"[{user_id}] Logged RR: {rr_ms:.1f} ms")
-                        offset += 2
-
-        return hr_data_handler
-
-    async def connect_to_device(self, mac, user_id, session_filename):
-        print(f"Connecting to {user_id} ({mac})...")
-        try:
-            client = BleakClient(mac)
-            await client.connect()
-            self.active_clients.append(client)
-            print(f"✅ Connected to {user_id}")
-
-            handler = self.create_hr_handler(user_id, session_filename)
-            await client.start_notify(HR_MEASUREMENT_UUID, handler)
-            
-        except Exception as e:
-            print(f"❌ Failed to connect to {user_id}: {e}")
 
     @asyncSlot()
     async def start_recording(self):
-        self.session_id = self.session_input.text().strip()
-        
-        if not self.session_id:
+        """Starts DataLogger on all sensors and disconnects BLE to run in low-energy mode."""
+        raw_session = self.session_input.text().strip()
+        if not raw_session:
             QMessageBox.warning(self, "Error", "Please enter a Session ID.")
             return
+
+        self.session_id = sanitize_filename_part(raw_session)
         if not self.sensors_to_connect:
             QMessageBox.warning(self, "Error", "Please add at least one sensor from the scan list.")
             return
 
-        # Double check User ID uniqueness
-        user_ids_lower = [sensor['user'].lower() for sensor in self.sensors_to_connect]
-        if len(user_ids_lower) != len(set(user_ids_lower)):
-            QMessageBox.critical(self, "Duplicate User ID", "Duplicate User IDs detected in the ready list. Each sensor must have a unique User ID.")
+        # Validate unique user IDs
+        user_ids = [s['user'].lower() for s in self.sensors_to_connect]
+        if len(user_ids) != len(set(user_ids)):
+            QMessageBox.critical(self, "Duplicate User ID", "Duplicate User IDs detected. Each sensor must have a unique User ID.")
             return
 
         self.is_recording = True
@@ -331,62 +939,246 @@ class MovesenseApp(QMainWindow):
         self.add_all_btn.setEnabled(False)
         self.remove_all_btn.setEnabled(False)
         self.remove_selected_btn.setEnabled(False)
+        # Lock mode selector for duration of session
+        self.radio_hr_only.setEnabled(False)
+        self.radio_full.setEnabled(False)
 
-        session_filename = f"{self.session_id}.csv"
-        with open(session_filename, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Timestamp", "UserID", "HeartRate_bpm", "RR_Interval_ms", "Event"])
-
+        # Initialize event marker CSV
         events_filename = f"{self.session_id}_events.csv"
         with open(events_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Timestamp", "Event"])
+            writer.writerow(["Timestamp", "Event", "Label", "Elapsed_Seconds"])
 
+        self.session_start_time = time.time()
+        self.sensor_time_anchors = {}
         self.event_counter = 1
+        self.event_name_input.clear()
+        self.event_name_input.setEnabled(True)
         self.add_event_btn.setText("📍 Add Event (Event1)")
         self.add_event_btn.setEnabled(True)
-        self.event_status_label.setText("Recording active. Click above or press Ctrl+E to log Event1.")
+        mode_label = "ECG + HR/RR" if self.ecg_enabled else "HR/RR only"
+        self.event_status_label.setText(f"Starting DataLogger on sensors [{mode_label}]...")
 
-        print(f"Started recording session: {self.session_id}")
+        started_sensors = []
+        failed_sensors = []
 
+        # Connect sequentially to avoid [org.bluez.Error.InProgress]
         for sensor in self.sensors_to_connect:
-            await self.connect_to_device(sensor['mac'], sensor['user'], session_filename)
-            await asyncio.sleep(0.5)
+            user_id = sensor['user']
+            mac = sensor['mac']
+            self.log(f"\n🔄 Connecting to {user_id} ({mac}) via Whiteboard...")
+            self.event_status_label.setText(f"Starting DataLogger on {user_id} ({mac})...")
 
-        if not self.active_clients:
-            print("❌ No sensors were successfully connected.")
-            QMessageBox.critical(self, "Connection Error", "Failed to connect to any sensors.")
-            await self.stop_recording()
+            client = MovesenseSensorClient(mac)
+            try:
+                await client.connect()
+                self.log(f"✅ Connected to {user_id} (Protocol: {'GSP' if client.uses_gsp else 'Whiteboard V9'})")
+
+                # Pre-flight time sync & anchor
+                synced, rtt_ms = await client.sync_utc_time()
+                if synced:
+                    self.log(f"⏱️ Sensor {user_id} clock synchronized with host (one-way BLE latency: {rtt_ms/2:.1f} ms)")
+
+                start_anchor = await client.get_time_detailed()
+                if start_anchor:
+                    self.sensor_time_anchors[user_id] = {'start': start_anchor}
+
+                streams = "ECG 125Hz + HR/RR + Time" if self.ecg_enabled else "HR/RR + Time"
+                self.log(f"🚀 Configuring DataLogger ({streams}) and starting logging on {user_id}...")
+                ok = await client.configure_and_start_logging(ecg_enabled=self.ecg_enabled)
+                if ok:
+                    self.log(f"✅ {user_id} DataLogger is now LOGGING internally [{mode_label}].")
+                    started_sensors.append(user_id)
+                else:
+                    self.log(f"❌ {user_id} failed to transition to LOGGING.")
+                    failed_sensors.append(user_id)
+            except Exception as e:
+                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self.log(f"❌ Failed to start {user_id}: {err_desc}")
+                failed_sensors.append(user_id)
+            finally:
+                # Disconnect BLE so the sensor logs in low-power mode
+                await client.disconnect()
+                self.log(f"🔌 BLE disconnected for {user_id} (Operating autonomously in Low-Power mode).")
+                await asyncio.sleep(0.5)
+
+        if not started_sensors:
+            QMessageBox.critical(self, "Recording Failed", "Failed to start DataLogger on any sensor.")
+            self.is_recording = False
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.session_input.setEnabled(True)
+            self.scan_btn.setEnabled(True)
+            self.add_all_btn.setEnabled(True)
+            self.remove_all_btn.setEnabled(True)
+            self.remove_selected_btn.setEnabled(True)
+            self.add_event_btn.setEnabled(False)
+            self.event_name_input.setEnabled(False)
+            self.radio_hr_only.setEnabled(True)
+            self.radio_full.setEnabled(True)
+            self.event_status_label.setText("Ready.")
+            return
+
+        status_text = f"Sensors logging internally: {', '.join(started_sensors)} (Low-Power Mode Active)"
+        if failed_sensors:
+            status_text += f" | Failed: {', '.join(failed_sensors)}"
+        self.event_status_label.setText(status_text)
+        self.log(f"\n🎉 Session '{self.session_id}' is active! Sensors are recording internally in low-power mode.")
 
     @asyncSlot()
     async def stop_recording(self):
-        print("Stopping recording and disconnecting sensors...")
+        """Reconnects, stops DataLogger, downloads SBEM logs, verifies integrity, exports CSVs, and safely clears sensor memory."""
+        ensure_bluetooth_powered()
         self.is_recording = False
         self.stop_btn.setEnabled(False)
         self.add_event_btn.setEnabled(False)
-        self.event_status_label.setText(f"Session finished. Total events logged: {self.event_counter - 1}")
-        
-        # Disconnect clients
-        for client in self.active_clients:
-            if client.is_connected:
-                await client.stop_notify(HR_MEASUREMENT_UUID)
+        self.event_name_input.setEnabled(False)
+        self.event_status_label.setText("Stopping sensors and retrieving logs via Whiteboard...")
+
+        downloaded_files = []
+        cleared_sensors = []
+
+        for sensor in self.sensors_to_connect:
+            user_id = sensor['user']
+            mac = sensor['mac']
+            self.log(f"\n🔄 Reconnecting to {user_id} ({mac}) to stop logging & retrieve data...")
+            self.event_status_label.setText(f"Reconnecting to {user_id} ({mac})...")
+
+            client = MovesenseSensorClient(mac)
+            try:
+                await client.connect()
+                self.log(f"✅ Connected to {user_id}.")
+
+                # 1. Post-flight time anchor for clock drift compensation
+                stop_anchor = await client.get_time_detailed()
+                drift_rate = 1.0
+                start_anchor = self.sensor_time_anchors.get(user_id, {}).get('start')
+
+                if start_anchor and stop_anchor:
+                    delta_host = stop_anchor['host_time'] - start_anchor['host_time']
+                    delta_sensor = (stop_anchor['rel_ms'] - start_anchor['rel_ms']) / 1000.0
+                    if delta_host > 5.0 and delta_sensor > 0.0:
+                        drift_rate = delta_host / delta_sensor
+                        drift_ms = (delta_sensor - delta_host) * 1000.0
+                        drift_ppm = (drift_rate - 1.0) * 1_000_000.0
+                        self.log(f"⏱️ Clock drift analysis for {user_id}: host ΔT={delta_host:.2f}s, sensor ΔT={delta_sensor:.2f}s (drift: {drift_ms:+.1f} ms, {drift_ppm:+.1f} ppm)")
+
+                # 2. Stop DataLogger (State 2 = DATALOGGER_READY)
+                self.log(f"⏹ Stopping DataLogger on {user_id}...")
+                await client.stop_logging()
+                await asyncio.sleep(0.4)
+
+                # 3. Get latest log ID and expected size
+                log_id, expected_size = await client.get_latest_log_id()
+                size_str = f" (expected size: {expected_size} bytes)" if expected_size > 0 else ""
+                self.log(f"📋 Target Log ID: {log_id}{size_str}")
+
+                # 4. Download raw SBEM log file with automatic retry
+                target_sbem = f"{self.session_id}_{sanitize_filename_part(user_id)}.sbem"
+                target_ecg_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_ecg.csv"
+                target_hr_csv = f"{self.session_id}_{sanitize_filename_part(user_id)}_hr_rr.csv"
+
+                def on_progress(bytes_dl):
+                    self.event_status_label.setText(f"📥 Downloading {user_id}: {bytes_dl / 1024:.1f} KB received...")
+
+                download_success = False
+                for dl_attempt in range(1, 4):
+                    attempt_str = f" (attempt {dl_attempt}/3)" if dl_attempt > 1 else ""
+                    self.log(f"📥 Downloading Log ID {log_id} to {target_sbem}{attempt_str}...")
+                    self.event_status_label.setText(f"📥 Downloading Log ID {log_id} from {user_id}{attempt_str}...")
+
+                    download_success = await client.download_log_data(
+                        log_id, target_sbem, expected_size=expected_size, progress_callback=on_progress
+                    )
+                    if download_success:
+                        break
+
+                    if dl_attempt < 3:
+                        self.log(f"⚠️ Incomplete download for {user_id}. Re-establishing clean connection for retry...")
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0)
+                        try:
+                            await client.connect()
+                        except Exception as e_rec:
+                            self.log(f"⚠️ Reconnect error: {e_rec}")
+
+                # 5. Integrity Verification & CSV Export
+                file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and download_success) else 0
+
+                if file_size > 0 and download_success:
+                    self.log(f"✅ Verified complete log download: {target_sbem} ({file_size} bytes).")
+                    self.event_status_label.setText(f"Parsing & exporting CSV for {user_id}...")
+                    counts = await export_sbem_to_csv(
+                        target_sbem, user_id, target_ecg_csv, target_hr_csv,
+                        ecg_enabled=self.ecg_enabled,
+                        drift_rate=drift_rate,
+                        start_anchor=start_anchor,
+                        fallback_start_time=self.session_start_time
+                    )
+                    if self.ecg_enabled:
+                        self.log(f"📊 Extracted {counts['ecg_count']} ECG samples and {counts['rr_count']} RR intervals.")
+                        downloaded_files.append(
+                            f"{target_sbem} ({file_size} bytes, {counts['ecg_count']} ECG, {counts['rr_count']} RR)"
+                        )
+                    else:
+                        self.log(f"📊 Extracted {counts['rr_count']} RR intervals (HR/RR only mode).")
+                        downloaded_files.append(
+                            f"{target_sbem} ({file_size} bytes, {counts['rr_count']} RR intervals)"
+                        )
+
+                    # 6. Safe Memory Erase (only executed after verified download)
+                    self.log(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
+                    try:
+                        if not client.client or not client.client.is_connected:
+                            await client.connect()
+                        await asyncio.sleep(0.5)
+                        erased = await client.clear_logbook()
+                        if erased:
+                            cleared_sensors.append(user_id)
+                            self.log(f"✅ Sensor memory cleared successfully for {user_id}.")
+                        else:
+                            self.log(f"⚠️ Erase command unacknowledged by {user_id}.")
+                    except Exception as e_erase:
+                        self.log(f"⚠️ Memory erase warning for {user_id}: {e_erase}")
+                    finally:
+                        await client.disconnect()
+                else:
+                    self.log(f"⚠️ Download incomplete or unverified for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
+                    await client.disconnect()
+
+            except Exception as e:
+                err_desc = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self.log(f"❌ Error during stop/retrieve for {user_id}: {err_desc}")
+            finally:
                 await client.disconnect()
-                
-        self.active_clients.clear()
-        print(f"Session {self.session_id} saved successfully.")
-        QMessageBox.information(
-            self, 
-            "Saved", 
-            f"Data saved to:\n- {self.session_id}.csv\n- {self.session_id}_events.csv ({self.event_counter - 1} events logged)"
+                await asyncio.sleep(0.5)
+
+        summary_text = (
+            f"Session '{self.session_id}' finished.\n\n"
+            f"Events Logged: {self.event_counter - 1} ({self.session_id}_events.csv)\n\n"
+            f"Downloaded & Exported Files:\n" + 
+            ("\n".join(f"- {f}" for f in downloaded_files) if downloaded_files else "None") + "\n\n"
+            f"Sensors Safely Cleared: {', '.join(cleared_sensors) if cleared_sensors else 'None'}"
         )
-        
-        # Reset UI elements
+
+        QMessageBox.information(self, "Recording Complete", summary_text)
+        self.event_status_label.setText(f"Session finished. Total events logged: {self.event_counter - 1}")
+
+        # Reset UI
         self.start_btn.setEnabled(True)
         self.session_input.setEnabled(True)
         self.scan_btn.setEnabled(True)
         self.add_all_btn.setEnabled(True)
         self.remove_all_btn.setEnabled(True)
         self.remove_selected_btn.setEnabled(True)
+        self.radio_hr_only.setEnabled(True)
+        self.radio_full.setEnabled(True)
+        self.event_name_input.setEnabled(False)
+        self.event_name_input.clear()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
