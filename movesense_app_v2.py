@@ -469,11 +469,14 @@ class MovesenseSensorClient:
     async def clear_logbook(self) -> bool:
         """Erases all stored logs from the sensor internal memory (CLEAR_LOGBOOK).
         
-        Retries once if a transient GATT error occurs after a data transfer.
+        Ensures a clean connection and retries with reconnection if a GATT collision occurs.
         """
         if self.uses_gsp:
             for attempt in range(2):
                 try:
+                    if self.client is None or not self.client.is_connected:
+                        await self.connect()
+
                     while not self.response_queue.empty():
                         self.response_queue.get_nowait()
                     await self.client.write_gatt_char(GSP_WRITE_CHAR_UUID, bytearray([5, 107]), response=True)
@@ -485,7 +488,11 @@ class MovesenseSensorClient:
                     return False
                 except Exception as e:
                     if attempt == 0:
-                        print(f"⚠️ Clear attempt {attempt+1} failed ({type(e).__name__}), retrying after 2s...")
+                        print(f"⚠️ Clear attempt {attempt+1} failed ({type(e).__name__}), reconnecting after 2s...")
+                        try:
+                            await self.disconnect()
+                        except Exception:
+                            pass
                         await asyncio.sleep(2.0)
                     else:
                         print(f"❌ Clear failed after retry: {type(e).__name__}: {e}")
@@ -691,13 +698,22 @@ class MovesenseApp(QMainWindow):
 
         # --- Live Event Controls ---
         main_layout.addWidget(QLabel("--- Step 3: Live Event Marker ---"))
+        event_layout = QHBoxLayout()
+        self.event_name_input = QLineEdit()
+        self.event_name_input.setPlaceholderText("Event label (e.g., Baseline, Stress, Recovery)")
+        self.event_name_input.setEnabled(False)
+        self.event_name_input.returnPressed.connect(self.add_event)
+
         self.add_event_btn = QPushButton("📍 Add Event (Event1)")
         self.add_event_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px; font-size: 13px;")
         self.add_event_btn.setEnabled(False)
         self.add_event_btn.setShortcut("Ctrl+E")
-        self.add_event_btn.setToolTip("Click or press Ctrl+E to log an incremental event marker")
+        self.add_event_btn.setToolTip("Click, press Enter in label box, or press Ctrl+E to log an event marker")
         self.add_event_btn.clicked.connect(self.add_event)
-        main_layout.addWidget(self.add_event_btn)
+
+        event_layout.addWidget(self.event_name_input, 2)
+        event_layout.addWidget(self.add_event_btn, 1)
+        main_layout.addLayout(event_layout)
 
         self.event_status_label = QLabel("Ready. Scan sensors and assign User IDs to begin.")
         self.event_status_label.setStyleSheet("color: #666; font-style: italic;")
@@ -734,11 +750,14 @@ class MovesenseApp(QMainWindow):
         self.sensor_list_ui.clear()
 
     def add_event(self):
-        """Logs an event marker with current ISO-8601 timestamp and incremented Event#."""
+        """Logs an event marker with current ISO-8601 timestamp, label, and incremented Event#."""
         if not self.is_recording:
             return
 
-        event_name = f"Event{self.event_counter}"
+        raw_label = self.event_name_input.text().strip()
+        event_id = f"Event{self.event_counter}"
+        event_label = raw_label if raw_label else event_id
+
         now_dt = datetime.now().astimezone()
         timestamp = now_dt.isoformat(timespec='milliseconds')
         elapsed_s = f"{(time.time() - self.session_start_time):.3f}" if self.session_start_time else "0.000"
@@ -747,13 +766,15 @@ class MovesenseApp(QMainWindow):
         try:
             with open(events_filename, mode='a', newline='') as file:
                 writer = csv.writer(file)
-                writer.writerow([timestamp, event_name, elapsed_s])
+                writer.writerow([timestamp, event_id, event_label, elapsed_s])
 
-            self.log(f"[{timestamp}] 📍 Logged {event_name} (Elapsed: {elapsed_s}s)")
+            self.log(f"[{timestamp}] 📍 Logged {event_id} - Label: '{event_label}' (Elapsed: {elapsed_s}s)")
             display_time = timestamp.split('T')[1] if 'T' in timestamp else timestamp
-            self.event_status_label.setText(f"✅ Last logged: {event_name} at {display_time}")
+            self.event_status_label.setText(f"✅ Last logged: {event_id} ('{event_label}') at {display_time}")
             self.event_counter += 1
             self.add_event_btn.setText(f"📍 Add Event (Event{self.event_counter})")
+            self.event_name_input.clear()
+            self.event_name_input.setFocus()
         except Exception as e:
             self.log(f"❌ Failed to log event: {e}")
             self.event_status_label.setText(f"❌ Error logging event: {e}")
@@ -874,11 +895,13 @@ class MovesenseApp(QMainWindow):
         events_filename = f"{self.session_id}_events.csv"
         with open(events_filename, mode='w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(["Timestamp", "Event", "Elapsed_Seconds"])
+            writer.writerow(["Timestamp", "Event", "Label", "Elapsed_Seconds"])
 
         self.session_start_time = time.time()
         self.sensor_time_anchors = {}
         self.event_counter = 1
+        self.event_name_input.clear()
+        self.event_name_input.setEnabled(True)
         self.add_event_btn.setText("📍 Add Event (Event1)")
         self.add_event_btn.setEnabled(True)
         mode_label = "ECG + HR/RR" if self.ecg_enabled else "HR/RR only"
@@ -938,6 +961,7 @@ class MovesenseApp(QMainWindow):
             self.remove_all_btn.setEnabled(True)
             self.remove_selected_btn.setEnabled(True)
             self.add_event_btn.setEnabled(False)
+            self.event_name_input.setEnabled(False)
             self.radio_hr_only.setEnabled(True)
             self.radio_full.setEnabled(True)
             self.event_status_label.setText("Ready.")
@@ -956,6 +980,7 @@ class MovesenseApp(QMainWindow):
         self.is_recording = False
         self.stop_btn.setEnabled(False)
         self.add_event_btn.setEnabled(False)
+        self.event_name_input.setEnabled(False)
         self.event_status_label.setText("Stopping sensors and retrieving logs via Whiteboard...")
 
         downloaded_files = []
@@ -1007,6 +1032,9 @@ class MovesenseApp(QMainWindow):
                     self.event_status_label.setText(f"📥 Downloading {user_id}: {bytes_dl / 1024:.1f} KB received...")
 
                 success = await client.download_log_data(log_id, target_sbem, progress_callback=on_progress)
+                # Disconnect download connection cleanly before parsing & memory erase
+                await client.disconnect()
+                await asyncio.sleep(0.4)
 
                 # 5. Integrity Verification & CSV Export
                 file_size = os.path.getsize(target_sbem) if (os.path.exists(target_sbem) and success) else 0
@@ -1030,14 +1058,21 @@ class MovesenseApp(QMainWindow):
                             f"{target_sbem} ({file_size} bytes, {counts['rr_count']} RR intervals)"
                         )
 
-                    # 5. Safe Memory Erase
+                    # 6. Safe Memory Erase (performed in a fresh, clean connection session)
                     self.log(f"🗑️ Safely erasing internal sensor memory on {user_id}...")
-                    erased = await client.clear_logbook()
-                    if erased:
-                        cleared_sensors.append(user_id)
-                        self.log(f"✅ Sensor memory cleared successfully for {user_id}.")
-                    else:
-                        self.log(f"⚠️ Erase command unacknowledged by {user_id}.")
+                    erase_client = MovesenseSensorClient(mac)
+                    try:
+                        await erase_client.connect()
+                        erased = await erase_client.clear_logbook()
+                        if erased:
+                            cleared_sensors.append(user_id)
+                            self.log(f"✅ Sensor memory cleared successfully for {user_id}.")
+                        else:
+                            self.log(f"⚠️ Erase command unacknowledged by {user_id}.")
+                    except Exception as e_erase:
+                        self.log(f"⚠️ Memory erase warning for {user_id}: {e_erase}")
+                    finally:
+                        await erase_client.disconnect()
                 else:
                     self.log(f"⚠️ Download incomplete or empty for {user_id}. Sensor internal memory NOT cleared to prevent data loss!")
 
@@ -1068,6 +1103,8 @@ class MovesenseApp(QMainWindow):
         self.remove_selected_btn.setEnabled(True)
         self.radio_hr_only.setEnabled(True)
         self.radio_full.setEnabled(True)
+        self.event_name_input.setEnabled(False)
+        self.event_name_input.clear()
 
 
 if __name__ == "__main__":
