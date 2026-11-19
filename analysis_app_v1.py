@@ -1,11 +1,16 @@
 """
 HRV Block Analysis (v1)
 
-Analyzes RR-interval recordings (<session>.csv) split into blocks by labelled events
-(<session>_events.csv), per UserID and for the group, using neurokit2.
+Analyzes RR-interval recordings split into blocks by labelled events, per UserID
+and for the group, using neurokit2.
 
-RR file columns   : Timestamp, UserID, HeartRate_bpm, RR_Interval_ms[, Event]
-Events file columns: Timestamp, Event[, Label]
+Data format (Movesense Whiteboard DataLogger output):
+  RR files (one per user): <session>_<UserID>_hr_rr.csv
+    Columns: Timestamp, UserID, HeartRate_bpm, RR_Interval_ms, Elapsed_Seconds
+  Events file:             <session>_events.csv
+    Columns: Timestamp, Event, Label, Elapsed_Seconds
+
+Timestamps are ISO-8601 with timezone offset (e.g. 2026-11-19T13:33:18.324+01:00).
 
 Each event marks the START of a block named by its Label. Data before the first event is
 discarded; the last block ends at the last RR sample.
@@ -16,11 +21,13 @@ Metrics
   SampEn, mean HR, beats, % corrected beats
 """
 
+import os
 import sys
+import glob
 import asyncio
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -30,7 +37,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton,
                              QMessageBox, QTableWidget, QTableWidgetItem,
                              QHeaderView, QFileDialog, QDoubleSpinBox,
-                             QComboBox, QTabWidget, QFormLayout)
+                             QComboBox, QTabWidget, QFormLayout, QListWidget,
+                             QAbstractItemView)
 from qasync import QEventLoop, asyncSlot
 
 import matplotlib
@@ -103,7 +111,8 @@ def load_events(path: str) -> pd.DataFrame:
     ev.columns = [c.strip() for c in ev.columns]
     if "Timestamp" not in ev.columns:
         raise ValueError("Events file must have a 'Timestamp' column.")
-    ev["Timestamp"] = pd.to_datetime(ev["Timestamp"])
+    ev["Timestamp"] = pd.to_datetime(ev["Timestamp"], utc=True)
+    ev["Timestamp"] = ev["Timestamp"].dt.tz_convert(None)  # strip tz for consistent arithmetic
     if "Label" not in ev.columns or ev["Label"].isna().all():
         ev["Label"] = ev.get("Event", pd.Series([f"Block{i + 1}" for i in range(len(ev))]))
     ev["Label"] = ev["Label"].fillna(ev.get("Event")).astype(str)
@@ -114,17 +123,48 @@ def load_events(path: str) -> pd.DataFrame:
 
 
 def load_rr(path: str) -> pd.DataFrame:
+    """Loads a single per-user RR CSV file.
+    Expected columns: Timestamp, UserID, HeartRate_bpm, RR_Interval_ms[, Elapsed_Seconds]
+    """
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
     for col in ("Timestamp", "UserID", "RR_Interval_ms"):
         if col not in df.columns:
-            raise ValueError(f"RR file is missing column '{col}'.")
+            raise ValueError(f"RR file '{os.path.basename(path)}' is missing column '{col}'.")
     df = df[df["UserID"].astype(str).str.upper() != "EVENT"]
     df = df.dropna(subset=["RR_Interval_ms"]).copy()
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], utc=True)
+    df["Timestamp"] = df["Timestamp"].dt.tz_convert(None)  # strip tz for consistent arithmetic
     df["RR_Interval_ms"] = df["RR_Interval_ms"].astype(float)
     df["UserID"] = df["UserID"].astype(str)
     return df.sort_values("Timestamp").reset_index(drop=True)
+
+
+def load_rr_files(paths: List[str]) -> pd.DataFrame:
+    """Loads and concatenates multiple per-user RR CSV files into a single DataFrame."""
+    frames = []
+    for p in paths:
+        frames.append(load_rr(p))
+    if not frames:
+        raise ValueError("No RR files provided.")
+    df = pd.concat(frames, ignore_index=True)
+    return df.sort_values("Timestamp").reset_index(drop=True)
+
+
+def discover_rr_files(events_path: str) -> List[str]:
+    """Auto-discovers per-user RR files matching the session prefix of the events file.
+    e.g. for 't1234_events.csv' finds 't1234_*_hr_rr.csv'.
+    """
+    dirname = os.path.dirname(events_path) or "."
+    basename = os.path.basename(events_path)
+    # Extract session prefix: everything before '_events.csv'
+    if "_events.csv" in basename:
+        session = basename.rsplit("_events.csv", 1)[0]
+    else:
+        return []
+    pattern = os.path.join(dirname, f"{session}_*_hr_rr.csv")
+    found = sorted(glob.glob(pattern))
+    return found
 
 
 # ==============================================================================
@@ -255,11 +295,21 @@ def segment(us: UserSeries, a: float, b: float):
 # Main analysis
 # ==============================================================================
 
-def analyze(rr_path: str, events_path: str, s: Settings) -> Results:
+def analyze(rr_input: Union[str, List[str]], events_path: str, s: Settings) -> Results:
     ev = load_events(events_path)
-    df = load_rr(rr_path)
+    if isinstance(rr_input, (list, tuple)):
+        df = load_rr_files(list(rr_input))
+    elif isinstance(rr_input, str):
+        if os.path.isdir(rr_input):
+            found = glob.glob(os.path.join(rr_input, "*_hr_rr.csv"))
+            df = load_rr_files(found)
+        else:
+            df = load_rr_files([rr_input])
+    else:
+        raise ValueError("Invalid RR input format.")
+
     if df.empty:
-        raise ValueError("RR file contains no RR intervals.")
+        raise ValueError("RR data contains no RR intervals.")
 
     t0 = ev["Timestamp"].iloc[0]
     event_times = [(x - t0).total_seconds() for x in ev["Timestamp"]]
@@ -474,14 +524,14 @@ class AnalysisApp(QMainWindow):
         # --- Files ---
         main.addWidget(QLabel("--- Step 1: Select Data Files ---"))
         self.rr_input = QLineEdit()
-        self.rr_input.setPlaceholderText("RR intervals CSV, e.g. t5.csv")
-        rr_btn = QPushButton("📂 RR File...")
+        self.rr_input.setPlaceholderText("RR intervals CSV(s), e.g. t1234_User_1_hr_rr.csv (multiple allowed, separated by ;)")
+        rr_btn = QPushButton("📂 RR File(s)...")
         rr_btn.clicked.connect(self.browse_rr)
         row = QHBoxLayout(); row.addWidget(self.rr_input); row.addWidget(rr_btn)
         main.addLayout(row)
 
         self.ev_input = QLineEdit()
-        self.ev_input.setPlaceholderText("Events CSV, e.g. t5_events.csv (auto-filled)")
+        self.ev_input.setPlaceholderText("Events CSV, e.g. t1234_events.csv (auto-fills RR files)")
         ev_btn = QPushButton("📂 Events File...")
         ev_btn.clicked.connect(self.browse_events)
         row = QHBoxLayout(); row.addWidget(self.ev_input); row.addWidget(ev_btn)
@@ -549,25 +599,56 @@ class AnalysisApp(QMainWindow):
         sp.setRange(lo, hi); sp.setValue(val); sp.setSuffix(suffix); sp.setDecimals(0)
         return sp
 
+    def get_rr_paths(self) -> List[str]:
+        raw = self.rr_input.text().strip()
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+        return parts
+
     def browse_rr(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select RR CSV", "", "CSV files (*.csv)")
-        if path:
-            self.rr_input.setText(path)
-            guess = path[:-4] + "_events.csv"
-            import os
-            if os.path.exists(guess):
-                self.ev_input.setText(guess)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select RR CSV file(s)", "", "CSV files (*.csv)")
+        if paths:
+            if len(paths) == 1:
+                first = paths[0]
+                dirname = os.path.dirname(first) or "."
+                base = os.path.basename(first)
+                if "_hr_rr.csv" in base:
+                    session = base.split("_hr_rr.csv")[0]
+                    if "_User_" in session:
+                        session_name = session.split("_User_")[0]
+                    else:
+                        session_name = session.rsplit("_", 1)[0]
+                    companion = sorted(glob.glob(os.path.join(dirname, f"{session_name}_*_hr_rr.csv")))
+                    if companion:
+                        paths = companion
+                    events_guess = os.path.join(dirname, f"{session_name}_events.csv")
+                    if os.path.exists(events_guess):
+                        self.ev_input.setText(events_guess)
+
+            self.rr_input.setText("; ".join(paths))
+
+            if not self.ev_input.text().strip() and paths:
+                first = paths[0]
+                guess = first[:-4] + "_events.csv"
+                if os.path.exists(guess):
+                    self.ev_input.setText(guess)
 
     def browse_events(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Events CSV", "", "CSV files (*.csv)")
         if path:
             self.ev_input.setText(path)
+            found = discover_rr_files(path)
+            if found:
+                self.rr_input.setText("; ".join(found))
+                self.status_label.setText(f"Found {len(found)} RR files for session: {', '.join(os.path.basename(f) for f in found)}")
 
     @asyncSlot()
     async def run_analysis(self):
-        rr_path, ev_path = self.rr_input.text().strip(), self.ev_input.text().strip()
-        if not rr_path or not ev_path:
-            QMessageBox.warning(self, "Missing Files", "Please select both an RR file and an events file.")
+        rr_paths = self.get_rr_paths()
+        ev_path = self.ev_input.text().strip()
+        if not rr_paths or not ev_path:
+            QMessageBox.warning(self, "Missing Files", "Please select RR file(s) and an events file.")
             return
         s = Settings(self.win_spin.value(), self.step_spin.value(),
                      self.settle_spin.value(), self.art_spin.value())
@@ -575,7 +656,7 @@ class AnalysisApp(QMainWindow):
         self.analyze_btn.setText("Analyzing... please wait")
         self.status_label.setText("Running artifact correction and HRV analysis...")
         try:
-            self.results = await asyncio.to_thread(analyze, rr_path, ev_path, s)
+            self.results = await asyncio.to_thread(analyze, rr_paths, ev_path, s)
         except Exception as e:
             QMessageBox.critical(self, "Analysis Error", f"Analysis failed:\n{e}")
             self.status_label.setText(f"❌ Analysis failed: {e}")
@@ -629,8 +710,21 @@ class AnalysisApp(QMainWindow):
     def export_results(self):
         if not self.results:
             return
+        ev_text = self.ev_input.text().strip()
+        if ev_text:
+            if ev_text.lower().endswith("_events.csv"):
+                default_prefix = ev_text[:-11] + "_hrv"
+            elif ev_text.lower().endswith(".csv"):
+                default_prefix = ev_text[:-4] + "_hrv"
+            else:
+                default_prefix = ev_text + "_hrv"
+        else:
+            paths = self.get_rr_paths()
+            first = paths[0] if paths else "analysis"
+            default_prefix = first.split("_hr_rr")[0] + "_hrv"
+
         prefix, _ = QFileDialog.getSaveFileName(self, "Export prefix (files get suffixes)",
-                                                self.rr_input.text()[:-4] + "_hrv", "All files (*)")
+                                                default_prefix, "All files (*)")
         if not prefix:
             return
         prefix = prefix[:-4] if prefix.lower().endswith(".csv") else prefix
